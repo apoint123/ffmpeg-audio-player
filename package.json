@@ -1,0 +1,36 @@
+{
+	"name": "ffmpeg-audio-player",
+	"version": "0.1.0-rc1",
+	"type": "module",
+	"files": [
+		"dist"
+	],
+	"main": "./dist/ffmpeg-audio-player.umd.cjs",
+	"module": "./dist/ffmpeg-audio-player.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/ffmpeg-audio-player.js",
+			"require": "./dist/ffmpeg-audio-player.umd.cjs"
+		}
+	},
+	"scripts": {
+		"dev": "vite",
+		"build": "tsc -b && vite build",
+		"lint": "biome lint .",
+		"prepublishOnly": "npm run build"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.3.11",
+		"@types/bun": "latest",
+		"@types/react": "^19.2.7",
+		"@types/react-dom": "^19.2.3",
+		"@vitejs/plugin-react-swc": "^4.2.2",
+		"react": "^19.2.3",
+		"react-dom": "^19.2.3",
+		"typescript": "^5.9.3",
+		"vite": "^7.3.0",
+		"vite-plugin-dts": "^4.5.4"
+	}
+}
