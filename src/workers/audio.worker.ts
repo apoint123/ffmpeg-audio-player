@@ -34,7 +34,7 @@ class DecoderSession {
 
 	constructor(
 		private module: AudioDecoderModule,
-		private req: WorkerRequest & { type: "INIT" },
+		public req: WorkerRequest & { type: "INIT" },
 	) {
 		this.mountDir = `/session_${req.id}`;
 		this.init();
@@ -224,12 +224,12 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 			}
 			break;
 		case "PAUSE":
-			if (currentSession && currentSession["req"].id === req.id) {
+			if (currentSession && currentSession.req.id === req.id) {
 				currentSession.pause();
 			}
 			break;
 		case "RESUME":
-			if (currentSession && currentSession["req"].id === req.id) {
+			if (currentSession && currentSession.req.id === req.id) {
 				currentSession.resume();
 			}
 			break;
