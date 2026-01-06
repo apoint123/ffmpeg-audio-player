@@ -6,210 +6,237 @@ import type {
 } from "@/types";
 import createAudioDecoderCore from "../assets/decode-audio.js";
 
-let ffmpegModule: AudioDecoderModule | null = null;
-let decoder: AudioStreamDecoder | null = null;
-let mountDir: string = "";
-let isDecoding = false;
-let isPaused = false;
-let currentId: number = 0;
-let currentChunkSize = 4096;
+let ffmpegModulePromise: Promise<AudioDecoderModule> | null = null;
 
-async function getModule(): Promise<AudioDecoderModule> {
-	if (ffmpegModule) return ffmpegModule;
-
-	ffmpegModule = (await createAudioDecoderCore({
-		locateFile: (path: string) => {
-			if (path.endsWith(".wasm")) {
-				return "/decode-audio.wasm";
-			}
-			return path;
-		},
-		print: (text: string) => console.log("[WASM]", text),
-		printErr: (text: string) => console.error("[WASM Error]", text),
-	})) as AudioDecoderModule;
-
-	return ffmpegModule;
+function getModule(): Promise<AudioDecoderModule> {
+	if (!ffmpegModulePromise) {
+		ffmpegModulePromise = createAudioDecoderCore({
+			locateFile: (path: string) =>
+				path.endsWith(".wasm") ? "/decode-audio.wasm" : path,
+			print: (text: string) => console.log("[WASM]", text),
+			printErr: (text: string) => console.error("[WASM Error]", text),
+		}) as Promise<AudioDecoderModule>;
+	}
+	return ffmpegModulePromise;
 }
 
-function postResponse(msg: WorkerResponse, transfer: Transferable[] = []) {
-	self.postMessage(msg, transfer);
-}
+class DecoderSession {
+	private decoder: AudioStreamDecoder | null = null;
+	private mountDir: string;
+	/**
+	 * 是否活着，用于退出循环
+	 */
+	private isRunning = true;
+	/**
+	 * 是否暂停，用于暂时挂起
+	 */
+	private isPaused = false;
 
-const processNextChunk = () => {
-	if (!isDecoding || !decoder) return;
-	if (isPaused) return;
-
-	try {
-		const result = decoder.readChunk(currentChunkSize);
-
-		// console.log(result.startTime);
-		if (result.status.status < 0) {
-			throw new Error(`Decode error: ${result.status.error}`);
-		}
-
-		const samplesView = result.samples;
-
-		if (samplesView.length > 0) {
-			const chunkData = samplesView.slice();
-
-			postResponse(
-				{
-					id: currentId,
-					type: "CHUNK",
-					data: chunkData,
-					startTime: result.startTime,
-				},
-				[chunkData.buffer],
-			);
-		}
-
-		const isEOF = result.isEOF;
-
-		if (isEOF) {
-			isDecoding = false;
-			postResponse({ id: currentId, type: "EOF" });
-		} else {
-			setTimeout(processNextChunk, 0);
-		}
-	} catch (e) {
-		postResponse({ id: currentId, type: "ERROR", error: (e as Error).message });
-		cleanupTask();
+	constructor(
+		private module: AudioDecoderModule,
+		private req: WorkerRequest & { type: "INIT" },
+	) {
+		this.mountDir = `/session_${req.id}`;
+		this.init();
 	}
-};
 
-const cleanupTask = () => {
-	isDecoding = false;
-	if (decoder) {
-		decoder.close();
-		decoder.delete();
-		decoder = null;
-	}
-	if (ffmpegModule && mountDir) {
+	private init() {
 		try {
-			ffmpegModule.FS.unmount(mountDir);
-			ffmpegModule.FS.rmdir(mountDir);
+			this.module.FS.mkdir(this.mountDir);
+			this.module.FS.mount(
+				this.module.FS.filesystems.WORKERFS,
+				{ files: [this.req.file] },
+				this.mountDir,
+			);
 		} catch (e) {
-			console.warn("清理时出错", e);
+			console.warn(`[DecoderSession] Mount error: ${e}`);
 		}
-		mountDir = "";
+
+		const filePath = `${this.mountDir}/${this.req.file.name}`;
+		this.decoder = new this.module.AudioStreamDecoder();
+		const props = this.decoder.init(filePath);
+
+		if (props.status.status < 0) {
+			throw new Error(`Decoder init failed: ${props.status.error}`);
+		}
+
+		const metadataObj: Record<string, string> = {};
+
+		const keysList = props.metadata.keys();
+
+		for (let i = 0; i < keysList.size(); i++) {
+			const key = keysList.get(i);
+			metadataObj[key] = props.metadata.get(key);
+		}
+
+		keysList.delete();
+
+		let coverUrl: string | undefined;
+		if (props.coverArt.size() > 0) {
+			const cover = new Uint8Array(props.coverArt.size());
+			for (let i = 0; i < props.coverArt.size(); i++) {
+				cover[i] = props.coverArt.get(i);
+			}
+			coverUrl = URL.createObjectURL(new Blob([cover]));
+		}
+
+		this.post({
+			type: "METADATA",
+			id: this.req.id,
+			sampleRate: props.sampleRate,
+			channels: props.channelCount,
+			duration: props.duration,
+			metadata: metadataObj,
+			encoding: props.encoding,
+			coverUrl,
+			bitsPerSample: props.bitsPerSample,
+		});
+
+		props.metadata?.delete();
+		props.coverArt?.delete();
+
+		this.decodeLoop();
 	}
-};
+
+	private decodeLoop = () => {
+		if (!this.isRunning) return;
+		if (this.isPaused || !this.decoder) return;
+
+		try {
+			const result = this.decoder.readChunk(this.req.chunkSize);
+
+			if (result.status.status < 0) {
+				throw new Error(`Decode error: ${result.status.error}`);
+			}
+
+			if (result.samples.length > 0) {
+				const chunkData = result.samples.slice();
+				this.post(
+					{
+						type: "CHUNK",
+						id: this.req.id,
+						data: chunkData,
+						startTime: result.startTime,
+					},
+					[chunkData.buffer],
+				);
+			}
+
+			if (result.isEOF) {
+				this.post({ type: "EOF", id: this.req.id });
+				this.isRunning = false;
+			} else {
+				// 让出主线程，避免 UI 卡死
+				setTimeout(this.decodeLoop, 0);
+			}
+		} catch (e) {
+			this.handleError(e);
+		}
+	};
+
+	public pause() {
+		this.isPaused = true;
+	}
+
+	public resume() {
+		if (this.isPaused) {
+			this.isPaused = false;
+			this.decodeLoop();
+		}
+	}
+
+	public seek(time: number, newId: number) {
+		if (!this.decoder) return;
+		try {
+			const result = this.decoder.seek(time);
+			if (result.status < 0) throw new Error(result.error);
+
+			this.req.id = newId;
+
+			this.post({ type: "SEEK_DONE", id: newId, time });
+
+			this.isRunning = true;
+			this.isPaused = false;
+			this.decodeLoop();
+		} catch (e) {
+			this.post({
+				type: "ERROR",
+				id: newId,
+				error: e instanceof Error ? e.message : String(e),
+			});
+			this.destroy();
+		}
+	}
+
+	public destroy() {
+		this.isRunning = false;
+
+		if (this.decoder) {
+			this.decoder.close();
+			this.decoder.delete();
+			this.decoder = null;
+		}
+
+		if (this.module && this.mountDir) {
+			try {
+				this.module.FS.unmount(this.mountDir);
+				this.module.FS.rmdir(this.mountDir);
+			} catch {
+				// 忽略卸载错误
+			}
+		}
+	}
+
+	private handleError(e: unknown) {
+		this.post({
+			type: "ERROR",
+			id: this.req.id,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		this.destroy();
+	}
+
+	private post(msg: WorkerResponse, transfer: Transferable[] = []) {
+		self.postMessage(msg, transfer);
+	}
+}
+
+let currentSession: DecoderSession | null = null;
 
 self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 	const req = e.data;
 
-	if (req.type === "PAUSE") {
-		isPaused = true;
-		return;
-	}
+	switch (req.type) {
+		case "INIT":
+			currentSession?.destroy();
+			currentSession = null;
 
-	if (req.type === "RESUME") {
-		if (isPaused && isDecoding) {
-			isPaused = false;
-			processNextChunk();
-		}
-		return;
-	}
-
-	if (req.type === "SEEK") {
-		if (!decoder) return;
-		try {
-			const result = decoder.seek(req.seekTime);
-			if (result.status < 0) throw new Error(result.error);
-			currentId = req.id;
-
-			postResponse({ id: req.id, type: "SEEK_DONE", time: req.seekTime });
-
-			isPaused = false;
-			isDecoding = true;
-			processNextChunk();
-		} catch (e) {
-			console.error("Seek error", e);
-			postResponse({
-				id: req.id,
-				type: "ERROR",
-				error: (e as Error).message,
-			});
-		}
-		return;
-	}
-
-	if (req.type === "INIT") {
-		cleanupTask();
-
-		currentId = req.id;
-		currentChunkSize = req.chunkSize;
-		isDecoding = true;
-		isPaused = false;
-
-		try {
-			const module = await getModule();
-
-			mountDir = `/input_${req.id}`;
 			try {
-				module.FS.mkdir(mountDir);
-			} catch (e) {
-				console.warn(`挂载文件失败 ${e}`);
+				const module = await getModule();
+				currentSession = new DecoderSession(module, req);
+			} catch (err) {
+				self.postMessage({
+					type: "ERROR",
+					id: req.id,
+					error: `Module load failed: ${(err as Error).message}`,
+				});
+				console.error(err);
 			}
-
-			const WORKERFS = module.FS.filesystems.WORKERFS;
-			module.FS.mount(WORKERFS, { files: [req.file] }, mountDir);
-			const filePath = `${mountDir}/${req.file.name}`;
-
-			decoder = new module.AudioStreamDecoder();
-			const props = decoder.init(filePath);
-
-			if (props.status.status < 0) throw new Error(props.status.error);
-
-			const metadataObj: Record<string, string> = {};
-			const keysList = props.metadata.keys();
-			for (let i = 0; i < keysList.size(); i++) {
-				const key = keysList.get(i);
-				metadataObj[key] = props.metadata.get(key);
+			break;
+		case "PAUSE":
+			if (currentSession && currentSession["req"].id === req.id) {
+				currentSession.pause();
 			}
-			keysList.delete();
-
-			let coverUrl: string | undefined;
-			const coverVector = props.coverArt;
-			const coverSize = coverVector.size();
-
-			if (coverSize > 0) {
-				const coverArray = new Uint8Array(coverSize);
-				for (let i = 0; i < coverSize; i++) {
-					coverArray[i] = coverVector.get(i);
-				}
-				const blob = new Blob([coverArray]);
-				coverUrl = URL.createObjectURL(blob);
+			break;
+		case "RESUME":
+			if (currentSession && currentSession["req"].id === req.id) {
+				currentSession.resume();
 			}
-
-			if (props.metadata?.delete) {
-				props.metadata.delete();
+			break;
+		case "SEEK":
+			if (currentSession) {
+				currentSession.seek(req.seekTime, req.id);
 			}
-
-			if (props.coverArt?.delete) {
-				props.coverArt.delete();
-			}
-
-			postResponse({
-				id: req.id,
-				type: "METADATA",
-				sampleRate: props.sampleRate,
-				channels: props.channelCount,
-				duration: props.duration,
-				metadata: metadataObj,
-				encoding: props.encoding,
-				coverUrl: coverUrl,
-				bitsPerSample: props.bitsPerSample,
-			});
-
-			processNextChunk();
-		} catch (err) {
-			postResponse({
-				id: req.id,
-				type: "ERROR",
-				error: (err as Error).message,
-			});
-			cleanupTask();
-		}
+			break;
 	}
 };
