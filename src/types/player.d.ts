@@ -43,6 +43,12 @@ export type WorkerResponse =
 			coverUrl?: string | undefined;
 			bitsPerSample: number;
 	  }
-	| { type: "CHUNK"; id: number; data: Float32Array; time?: number }
+	| {
+			type: "CHUNK";
+			id: number;
+			data: Float32Array;
+			time?: number;
+			startTime: number;
+	  }
 	| { type: "EOF"; id: number }
 	| { type: "SEEK_DONE"; id: number; time: number };

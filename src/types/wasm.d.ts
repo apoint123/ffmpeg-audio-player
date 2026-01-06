@@ -83,6 +83,7 @@ export interface ChunkResult {
 	status: DecoderStatus;
 	samples: Float32Array;
 	isEOF: boolean;
+	startTime: number;
 }
 
 export interface AudioStreamDecoder extends EmbindObject {

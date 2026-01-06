@@ -25,11 +25,13 @@ export class FFmpegAudioPlayer extends EventTarget {
 	private isDecodingFinished = false;
 	private targetVolume = 1.0;
 
-	private flowControlInterval: number = 0;
 	private timeUpdateFrameId: number = 0;
 	private currentMessageId = 0;
 
 	public analyser: AnalyserNode | null = null;
+
+	// 用于标记是否是 Seek 或 Play 后的第一块数据
+	private isFirstChunk = true;
 
 	constructor(private workerFactory: () => Worker) {
 		super();
@@ -137,8 +139,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.worker = this.workerFactory();
 			this.setupWorkerListeners();
 
-			this.startFlowControl();
-
 			this.currentMessageId = Date.now();
 			this.postToWorker({
 				type: "INIT",
@@ -228,6 +228,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			seekTime: time,
 		});
 		this.isDecodingFinished = false;
+		this.isFirstChunk = true;
 
 		this.dispatch("timeUpdate", time);
 	}
@@ -258,12 +259,13 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 	private reset() {
 		this.stopTimeUpdate();
-		clearInterval(this.flowControlInterval);
 
 		if (this.worker) {
 			this.worker.terminate();
 			this.worker = null;
 		}
+
+		this.isFirstChunk = true;
 
 		this.activeSources.forEach((source) => {
 			try {
@@ -275,8 +277,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 		this.activeSources = [];
 
 		this.metadata = null;
-		this.nextStartTime = 0;
-		this.timeOffset = 0;
 		this.isWorkerPaused = false;
 		this.isDecodingFinished = false;
 		this.timeOffset = this.audioCtx ? this.audioCtx.currentTime : 0;
@@ -338,6 +338,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 							resp.data,
 							this.metadata.sampleRate,
 							this.metadata.channels,
+							resp.startTime,
 						);
 
 						if (this.audioCtx) {
@@ -360,8 +361,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 				case "SEEK_DONE":
 					if (this.audioCtx && this.masterGain) {
 						const now = this.audioCtx.currentTime;
-						this.nextStartTime = now;
-						this.timeOffset = now - resp.time;
 						this.isWorkerPaused = false;
 
 						if (this.playerState === "playing") {
@@ -382,9 +381,11 @@ export class FFmpegAudioPlayer extends EventTarget {
 		planarData: Float32Array,
 		sampleRate: number,
 		channels: number,
+		chunkStartTime: number,
 	) {
 		if (!this.audioCtx || !this.masterGain || !this.analyser) return;
 		const ctx = this.audioCtx;
+
 		const safeChannels = channels || 1;
 		const frameCount = planarData.length / safeChannels;
 
@@ -392,25 +393,38 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 		for (let ch = 0; ch < safeChannels; ch++) {
 			const chData = audioBuffer.getChannelData(ch);
-
 			const start = ch * frameCount;
-			const end = start + frameCount;
+			chData.set(planarData.subarray(start, start + frameCount));
+		}
 
-			chData.set(planarData.subarray(start, end));
+		if (this.isFirstChunk) {
+			this.nextStartTime = ctx.currentTime;
+			this.timeOffset = this.nextStartTime - chunkStartTime;
+
+			this.isFirstChunk = false;
 		}
 
 		const source = ctx.createBufferSource();
 		source.buffer = audioBuffer;
 		source.connect(this.analyser);
 
-		const scheduleTime = Math.max(ctx.currentTime, this.nextStartTime);
+		source.start(this.nextStartTime);
 
-		source.start(scheduleTime);
-		this.nextStartTime = scheduleTime + audioBuffer.duration;
+		this.nextStartTime += audioBuffer.duration;
 
 		this.activeSources.push(source);
+
 		source.onended = () => {
 			this.activeSources = this.activeSources.filter((s) => s !== source);
+
+			if (this.audioCtx && !this.isDecodingFinished) {
+				const bufferedDuration = this.nextStartTime - this.audioCtx.currentTime;
+				if (bufferedDuration < LOW_WATER_MARK && this.isWorkerPaused) {
+					this.postToWorker({ type: "RESUME", id: this.currentMessageId });
+					this.isWorkerPaused = false;
+				}
+			}
+
 			this.checkIfEnded();
 		};
 	}
@@ -422,22 +436,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 		this.setState("idle");
 		this.dispatch("ended");
-	}
-
-	private startFlowControl() {
-		this.flowControlInterval = window.setInterval(() => {
-			if (!this.worker || !this.audioCtx) return;
-
-			const bufferedDuration = this.nextStartTime - this.audioCtx.currentTime;
-
-			if (bufferedDuration > HIGH_WATER_MARK && !this.isWorkerPaused) {
-				this.postToWorker({ type: "PAUSE", id: this.currentMessageId });
-				this.isWorkerPaused = true;
-			} else if (bufferedDuration < LOW_WATER_MARK && this.isWorkerPaused) {
-				this.postToWorker({ type: "RESUME", id: this.currentMessageId });
-				this.isWorkerPaused = false;
-			}
-		}, 1000);
 	}
 
 	private startTimeUpdate() {

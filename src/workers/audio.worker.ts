@@ -42,6 +42,7 @@ const processNextChunk = () => {
 	try {
 		const result = decoder.readChunk(currentChunkSize);
 
+		// console.log(result.startTime);
 		if (result.status.status < 0) {
 			throw new Error(`Decode error: ${result.status.error}`);
 		}
@@ -56,6 +57,7 @@ const processNextChunk = () => {
 					id: currentId,
 					type: "CHUNK",
 					data: chunkData,
+					startTime: result.startTime,
 				},
 				[chunkData.buffer],
 			);

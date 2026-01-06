@@ -44,6 +44,7 @@ struct ChunkResult
     Status status;
     emscripten::val samples;
     bool isEOF;
+    double startTime;
 };
 
 std::string get_error_str(int status)
@@ -174,6 +175,11 @@ private:
     // 用于最终输出的交错或拼接后的数据
     std::vector<float> m_pcm_output;
 
+    // 下一帧预期的 PTS ，基于 time_base
+    int64_t m_next_pts = AV_NOPTS_VALUE;
+    // 当前流的时间基
+    AVRational m_time_base = {1, 1};
+
 public:
     AudioStreamDecoder() {}
 
@@ -244,6 +250,9 @@ public:
         packet.reset(av_packet_alloc());
         frame.reset(av_frame_alloc());
 
+        m_time_base = format_ctx->streams[audio_stream_index]->time_base;
+        m_next_pts = AV_NOPTS_VALUE;
+
         initialized = true;
 
         std::map<std::string, std::string> meta_map;
@@ -312,6 +321,7 @@ public:
         ChunkResult result;
         result.status.status = 0;
         result.isEOF = false;
+        result.startTime = -1.0;
 
         int output_channels = codec_ctx->ch_layout.nb_channels;
 
@@ -334,6 +344,42 @@ public:
 
             if (receive_ret == 0)
             {
+
+                // 获取当前帧的 PTS
+                int64_t current_pts = frame->pts;
+                if (current_pts == AV_NOPTS_VALUE)
+                {
+                    current_pts = frame->best_effort_timestamp;
+                }
+
+                // 如果当前帧有 PTS，强制更新内部时钟；否则沿用递推值
+                if (current_pts != AV_NOPTS_VALUE)
+                {
+                    m_next_pts = current_pts;
+                }
+
+                // 如果是流的开头且没有 PTS，假定从 0 开始
+                if (m_next_pts == AV_NOPTS_VALUE)
+                {
+                    m_next_pts = 0;
+                }
+
+                // 如果是本 Chunk 的第一帧数据，记录起始时间
+                if (result.startTime < 0)
+                {
+                    result.startTime = m_next_pts * av_q2d(m_time_base);
+                }
+
+                // 计算当前帧持续时间并累加到 m_next_pts
+                // 时长 = 样本数 / 采样率，需要转换到 m_time_base 单位
+                if (frame->nb_samples > 0)
+                {
+                    int64_t duration = av_rescale_q(frame->nb_samples,
+                                                    (AVRational){1, codec_ctx->sample_rate},
+                                                    m_time_base);
+                    m_next_pts += duration;
+                }
+
                 int dst_nb_samples = av_rescale_rnd(swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate) + frame->nb_samples,
                                                     codec_ctx->sample_rate, codec_ctx->sample_rate, AV_ROUND_UP);
 
@@ -406,7 +452,7 @@ public:
             {
                 if (read_ret == AVERROR_EOF)
                 {
-                    avcodec_send_packet(codec_ctx.get(), nullptr); // Flush decoder
+                    avcodec_send_packet(codec_ctx.get(), nullptr);
                     continue;
                 }
                 else
@@ -468,6 +514,9 @@ public:
 
         avcodec_flush_buffers(codec_ctx.get());
 
+        // Seek 后重置预测时钟为 NOPTS，强制让下一帧的真实 PTS 来校准
+        m_next_pts = AV_NOPTS_VALUE;
+
         return status;
     }
 
@@ -480,6 +529,7 @@ public:
         format_ctx.reset();
         resample_buffer.reset();
         initialized = false;
+        m_next_pts = AV_NOPTS_VALUE;
 
         for (auto &buf : m_staging_buffers)
         {
@@ -513,7 +563,8 @@ EMSCRIPTEN_BINDINGS(my_module)
     value_object<ChunkResult>("ChunkResult")
         .field("status", &ChunkResult::status)
         .field("samples", &ChunkResult::samples)
-        .field("isEOF", &ChunkResult::isEOF);
+        .field("isEOF", &ChunkResult::isEOF)
+        .field("startTime", &ChunkResult::startTime);
 
     class_<AudioStreamDecoder>("AudioStreamDecoder")
         .constructor<>()
