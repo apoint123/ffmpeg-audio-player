@@ -1,46 +1,3 @@
-export type Pointer = number;
-export type FSFilesystemWORKERFS = object;
-
-export interface Stat {
-	dev: number;
-	ino: number;
-	mode: number;
-	nlink: number;
-	uid: number;
-	gid: number;
-	rdev: number;
-	size: number;
-	atime: string;
-	mtime: string;
-	ctime: string;
-	blksize: number;
-	blocks: number;
-}
-
-export interface FS {
-	mkdir: (path: string) => void;
-	rmdir: (path: string) => void;
-	rename: (oldPath: string, newPath: string) => void;
-	writeFile: (path: string, data: Uint8Array | string) => void;
-	readFile: (path: string, opts: { encoding: string }) => Uint8Array | string;
-	readdir: (path: string) => string[];
-	unlink: (path: string) => void;
-	stat: (path: string) => Stat;
-	mount: (
-		fileSystemType: FSFilesystemWORKERFS,
-		data: { files?: File[]; blobs?: { name: string; data: Blob }[] },
-		path: string,
-	) => void;
-	unmount: (path: string) => void;
-	filesystems: {
-		WORKERFS: FSFilesystemWORKERFS;
-	};
-}
-
-export interface FFmpegCoreModule {
-	FS: FS;
-}
-
 export interface EmbindObject {
 	delete(): void;
 	isDeleted(): boolean;
@@ -93,9 +50,13 @@ export interface AudioStreamDecoder extends EmbindObject {
 	close(): void;
 }
 
-export interface AudioDecoderModule extends FFmpegCoreModule {
+export interface AudioDecoderModule extends EmscriptenModule {
+	FS: typeof FS & {
+		filesystems: {
+			WORKERFS: Emscripten.FileSystemType;
+		};
+	};
 	AudioStreamDecoder: {
 		new (): AudioStreamDecoder;
 	};
-	WORKERFS: FSFilesystemWORKERFS;
 }
