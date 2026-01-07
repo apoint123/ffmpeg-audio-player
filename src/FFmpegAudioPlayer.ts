@@ -30,9 +30,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 	public analyser: AnalyserNode | null = null;
 
-	// 用于标记是否是 Seek 或 Play 后的第一块数据
-	private isFirstChunk = true;
-
 	constructor(private workerFactory: () => Worker) {
 		super();
 	}
@@ -103,7 +100,8 @@ export class FFmpegAudioPlayer extends EventTarget {
 	}
 	public get currentTime() {
 		if (!this.audioCtx) return 0;
-		return Math.max(0, this.audioCtx.currentTime - this.timeOffset);
+		const t = this.audioCtx.currentTime - this.timeOffset;
+		return Math.max(0, t);
 	}
 	public get audioInfo() {
 		return this.metadata;
@@ -163,13 +161,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.isWorkerPaused = false;
 		}
 
-		const now = this.audioCtx.currentTime;
-		this.masterGain.gain.cancelScheduledValues(now);
-		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-		this.masterGain.gain.linearRampToValueAtTime(
-			this.targetVolume,
-			now + FADE_DURATION,
-		);
+		this.rampGain(this.targetVolume, FADE_DURATION);
 
 		this.setState("playing");
 		this.startTimeUpdate();
@@ -186,10 +178,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.isWorkerPaused = true;
 		}
 
-		const now = this.audioCtx.currentTime;
-		this.masterGain.gain.cancelScheduledValues(now);
-		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-		this.masterGain.gain.linearRampToValueAtTime(0, now + FADE_DURATION);
+		this.rampGain(0, FADE_DURATION);
 
 		await new Promise((resolve) => setTimeout(resolve, FADE_DURATION * 1000));
 
@@ -202,11 +191,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (!this.worker || !this.audioCtx || !this.metadata || !this.masterGain)
 			return;
 
-		const now = this.audioCtx.currentTime;
-
-		this.masterGain.gain.cancelScheduledValues(now);
-		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-		this.masterGain.gain.linearRampToValueAtTime(0, now + SEEK_FADE_DURATION);
+		this.rampGain(0, SEEK_FADE_DURATION);
 
 		await new Promise((resolve) =>
 			setTimeout(resolve, SEEK_FADE_DURATION * 1000),
@@ -228,7 +213,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 			seekTime: time,
 		});
 		this.isDecodingFinished = false;
-		this.isFirstChunk = true;
 
 		this.dispatch("timeUpdate", time);
 	}
@@ -237,13 +221,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		this.targetVolume = Math.max(0, Math.min(1, val));
 
 		if (this.masterGain && this.playerState === "playing" && this.audioCtx) {
-			const now = this.audioCtx.currentTime;
-			this.masterGain.gain.cancelScheduledValues(now);
-			this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-			this.masterGain.gain.linearRampToValueAtTime(
-				this.targetVolume,
-				now + 0.05,
-			);
+			this.rampGain(this.targetVolume, 0.05);
 		}
 	}
 
@@ -264,8 +242,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.worker.terminate();
 			this.worker = null;
 		}
-
-		this.isFirstChunk = true;
 
 		this.activeSources.forEach((source) => {
 			try {
@@ -300,6 +276,16 @@ export class FFmpegAudioPlayer extends EventTarget {
 		console.error("[FFmpegAudioPlayer]", msg);
 		this.setState("error");
 		this.dispatch("error", msg);
+	}
+
+	private rampGain(target: number, duration: number) {
+		if (!this.masterGain || !this.audioCtx) return;
+
+		const now = this.audioCtx.currentTime;
+
+		this.masterGain.gain.cancelScheduledValues(now);
+		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
+		this.masterGain.gain.linearRampToValueAtTime(target, now + duration);
 	}
 
 	private setupWorkerListeners() {
@@ -362,6 +348,8 @@ export class FFmpegAudioPlayer extends EventTarget {
 					if (this.audioCtx && this.masterGain) {
 						const now = this.audioCtx.currentTime;
 						this.isWorkerPaused = false;
+						this.nextStartTime = now;
+						this.timeOffset = now - resp.time;
 
 						if (this.playerState === "playing") {
 							this.masterGain.gain.cancelScheduledValues(now);
@@ -397,12 +385,13 @@ export class FFmpegAudioPlayer extends EventTarget {
 			chData.set(planarData.subarray(start, start + frameCount));
 		}
 
-		if (this.isFirstChunk) {
-			this.nextStartTime = ctx.currentTime;
-			this.timeOffset = this.nextStartTime - chunkStartTime;
+		const now = this.audioCtx.currentTime;
 
-			this.isFirstChunk = false;
+		if (this.nextStartTime < now) {
+			this.nextStartTime = now;
 		}
+
+		this.timeOffset = this.nextStartTime - chunkStartTime;
 
 		const source = ctx.createBufferSource();
 		source.buffer = audioBuffer;
