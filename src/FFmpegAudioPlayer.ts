@@ -88,14 +88,6 @@ export class FFmpegAudioPlayer extends EventTarget {
 		type: K,
 		detail?: PlayerEventMap[K],
 	) {
-		const event = new CustomEvent(type, { detail });
-		this.dispatchEvent(event);
-	}
-
-	private emit<K extends keyof PlayerEventMap>(
-		type: K,
-		detail?: PlayerEventMap[K],
-	) {
 		switch (type) {
 			case "loadstart":
 				this.playerState = "loading";
@@ -138,6 +130,9 @@ export class FFmpegAudioPlayer extends EventTarget {
 		const t = this.audioCtx.currentTime - this.timeOffset;
 		return Math.max(0, t);
 	}
+	public get volume() {
+		return this.targetVolume;
+	}
 	public get audioInfo() {
 		return this.metadata;
 	}
@@ -148,7 +143,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 	public async load(file: File) {
 		this.reset();
-		this.emit("loadstart");
+		this.dispatch("loadstart");
 
 		try {
 			if (!this.audioCtx) {
@@ -180,14 +175,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 				chunkSize: 4096 * 8,
 			});
 		} catch (e) {
-			this.emit("error", (e as Error).message);
+			this.dispatch("error", (e as Error).message);
 		}
 	}
 
 	public async play() {
 		if (!this.audioCtx || !this.masterGain) return;
 
-		this.emit("play");
+		this.dispatch("play");
 
 		if (this.audioCtx.state === "suspended") {
 			await this.audioCtx.resume();
@@ -200,14 +195,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 		this.rampGain(this.targetVolume, FADE_DURATION);
 
-		this.emit("playing");
+		this.dispatch("playing");
 		this.startTimeUpdate();
 	}
 
 	public async pause() {
 		if (!this.audioCtx || !this.masterGain) return;
 
-		this.emit("pause");
+		this.dispatch("pause");
 		this.stopTimeUpdate();
 
 		if (this.worker) {
@@ -228,7 +223,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (!this.worker || !this.audioCtx || !this.metadata || !this.masterGain)
 			return;
 
-		this.emit("seeking");
+		this.dispatch("seeking");
 
 		this.rampGain(0, SEEK_FADE_DURATION);
 
@@ -247,7 +242,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		});
 		this.isDecodingFinished = false;
 
-		this.emit("timeupdate", time);
+		this.dispatch("timeupdate", time);
 	}
 
 	public setVolume(val: number) {
@@ -256,6 +251,8 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (this.masterGain && this.playerState === "playing" && this.audioCtx) {
 			this.rampGain(this.targetVolume, 0.05);
 		}
+
+		this.dispatch("volumechange", this.targetVolume);
 	}
 
 	private stopActiveSources() {
@@ -303,7 +300,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.masterGain.gain.value = 0;
 		}
 
-		this.emit("emptied");
+		this.dispatch("emptied");
 	}
 
 	private rampGain(target: number, duration: number) {
@@ -325,7 +322,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 			switch (resp.type) {
 				case "ERROR":
-					this.emit("error", resp.error);
+					this.dispatch("error", resp.error);
 					break;
 				case "METADATA":
 					this.metadata = {
@@ -342,9 +339,9 @@ export class FFmpegAudioPlayer extends EventTarget {
 						this.timeOffset = now;
 						this.nextStartTime = now;
 					}
-					this.emit("durationchange", resp.duration);
-					this.emit("loadedmetadata");
-					this.emit("canplay");
+					this.dispatch("durationchange", resp.duration);
+					this.dispatch("loadedmetadata");
+					this.dispatch("canplay");
 					break;
 				case "CHUNK":
 					if (this.metadata) {
@@ -388,7 +385,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 							);
 						}
 					}
-					this.emit("seeked");
+					this.dispatch("seeked");
 
 					break;
 			}
@@ -448,7 +445,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 				if (this.isDecodingFinished) {
 					this.checkIfEnded();
 				} else if (this.playerState === "playing") {
-					this.emit("waiting");
+					this.dispatch("waiting");
 				}
 			}
 
@@ -461,7 +458,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (this.activeSources.length > 0) return;
 		if (!this.isDecodingFinished) return;
 
-		this.emit("ended");
+		this.dispatch("ended");
 	}
 
 	private startTimeUpdate() {

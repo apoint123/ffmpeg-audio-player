@@ -27,6 +27,7 @@ export interface PlayerEventMap {
 	seeking: undefined;
 	seeked: undefined;
 	timeupdate: number;
+	volumechange: number;
 	durationchange: number;
 	ended: undefined;
 	error: string;
