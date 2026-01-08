@@ -92,6 +92,41 @@ export class FFmpegAudioPlayer extends EventTarget {
 		this.dispatchEvent(event);
 	}
 
+	private emit<K extends keyof PlayerEventMap>(
+		type: K,
+		detail?: PlayerEventMap[K],
+	) {
+		switch (type) {
+			case "loadstart":
+				this.playerState = "loading";
+				break;
+			case "canplay":
+			case "loadedmetadata":
+				if (this.playerState !== "playing" && this.playerState !== "error") {
+					this.playerState = "ready";
+				}
+				break;
+			case "playing":
+				this.playerState = "playing";
+				break;
+			case "pause":
+				this.playerState = "paused";
+				break;
+			case "ended":
+				this.playerState = "idle";
+				break;
+			case "error":
+				this.playerState = "error";
+				break;
+			case "emptied":
+				this.playerState = "idle";
+				break;
+		}
+
+		const event = new CustomEvent(type, { detail });
+		this.dispatchEvent(event);
+	}
+
 	public get state() {
 		return this.playerState;
 	}
@@ -113,7 +148,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 	public async load(file: File) {
 		this.reset();
-		this.setState("loading");
+		this.emit("loadstart");
 
 		try {
 			if (!this.audioCtx) {
@@ -130,8 +165,8 @@ export class FFmpegAudioPlayer extends EventTarget {
 				this.masterGain.connect(this.audioCtx.destination);
 			}
 
-			if (this.audioCtx.state === "suspended") {
-				await this.audioCtx.resume();
+			if (this.audioCtx.state === "running") {
+				await this.audioCtx.suspend();
 			}
 
 			this.worker = this.workerFactory();
@@ -145,12 +180,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 				chunkSize: 4096 * 8,
 			});
 		} catch (e) {
-			this.handleError((e as Error).message);
+			this.emit("error", (e as Error).message);
 		}
 	}
 
 	public async play() {
 		if (!this.audioCtx || !this.masterGain) return;
+
+		this.emit("play");
 
 		if (this.audioCtx.state === "suspended") {
 			await this.audioCtx.resume();
@@ -163,14 +200,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 		this.rampGain(this.targetVolume, FADE_DURATION);
 
-		this.setState("playing");
+		this.emit("playing");
 		this.startTimeUpdate();
 	}
 
 	public async pause() {
 		if (!this.audioCtx || !this.masterGain) return;
 
-		this.setState("paused");
+		this.emit("pause");
 		this.stopTimeUpdate();
 
 		if (this.worker) {
@@ -191,19 +228,15 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (!this.worker || !this.audioCtx || !this.metadata || !this.masterGain)
 			return;
 
+		this.emit("seeking");
+
 		this.rampGain(0, SEEK_FADE_DURATION);
 
 		await new Promise((resolve) =>
 			setTimeout(resolve, SEEK_FADE_DURATION * 1000),
 		);
 
-		this.activeSources.forEach((s) => {
-			try {
-				s.stop();
-			} catch (e) {
-				this.handleError((e as Error).message);
-			}
-		});
+		this.stopActiveSources();
 		this.activeSources = [];
 		this.currentMessageId = Date.now();
 
@@ -214,7 +247,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 		});
 		this.isDecodingFinished = false;
 
-		this.dispatch("timeUpdate", time);
+		this.emit("timeupdate", time);
 	}
 
 	public setVolume(val: number) {
@@ -225,8 +258,24 @@ export class FFmpegAudioPlayer extends EventTarget {
 		}
 	}
 
+	private stopActiveSources() {
+		this.activeSources.forEach((source) => {
+			try {
+				source.stop();
+			} catch {
+				// 忽略已停止的错误
+			}
+		});
+		this.activeSources = [];
+	}
+
 	public destroy() {
 		this.reset();
+
+		if (this.worker) {
+			this.worker.terminate();
+			this.worker = null;
+		}
 
 		if (this.audioCtx) {
 			this.audioCtx.close();
@@ -238,18 +287,9 @@ export class FFmpegAudioPlayer extends EventTarget {
 	private reset() {
 		this.stopTimeUpdate();
 
-		if (this.worker) {
-			this.worker.terminate();
-			this.worker = null;
-		}
+		this.audioCtx?.suspend();
 
-		this.activeSources.forEach((source) => {
-			try {
-				source.stop();
-			} catch {
-				// 忽略已停止的错误
-			}
-		});
+		this.stopActiveSources();
 		this.activeSources = [];
 
 		this.metadata = null;
@@ -263,19 +303,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.masterGain.gain.value = 0;
 		}
 
-		this.setState("idle");
-	}
-
-	private setState(newState: PlayerState) {
-		if (this.playerState === newState) return;
-		this.playerState = newState;
-		this.dispatch("stateChange", newState);
-	}
-
-	private handleError(msg: string) {
-		console.error("[FFmpegAudioPlayer]", msg);
-		this.setState("error");
-		this.dispatch("error", msg);
+		this.emit("emptied");
 	}
 
 	private rampGain(target: number, duration: number) {
@@ -297,7 +325,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 			switch (resp.type) {
 				case "ERROR":
-					this.handleError(resp.error);
+					this.emit("error", resp.error);
 					break;
 				case "METADATA":
 					this.metadata = {
@@ -314,9 +342,9 @@ export class FFmpegAudioPlayer extends EventTarget {
 						this.timeOffset = now;
 						this.nextStartTime = now;
 					}
-					this.dispatch("durationChange", resp.duration);
-					this.setState("ready");
-					this.play();
+					this.emit("durationchange", resp.duration);
+					this.emit("loadedmetadata");
+					this.emit("canplay");
 					break;
 				case "CHUNK":
 					if (this.metadata) {
@@ -360,6 +388,8 @@ export class FFmpegAudioPlayer extends EventTarget {
 							);
 						}
 					}
+					this.emit("seeked");
+
 					break;
 			}
 		};
@@ -414,6 +444,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 				}
 			}
 
+			if (this.activeSources.length === 0) {
+				if (this.isDecodingFinished) {
+					this.checkIfEnded();
+				} else if (this.playerState === "playing") {
+					this.emit("waiting");
+				}
+			}
+
 			this.checkIfEnded();
 		};
 	}
@@ -423,15 +461,14 @@ export class FFmpegAudioPlayer extends EventTarget {
 		if (this.activeSources.length > 0) return;
 		if (!this.isDecodingFinished) return;
 
-		this.setState("idle");
-		this.dispatch("ended");
+		this.emit("ended");
 	}
 
 	private startTimeUpdate() {
 		this.stopTimeUpdate();
 		const tick = () => {
 			if (this.state === "playing") {
-				this.dispatch("timeUpdate", this.currentTime);
+				this.dispatch("timeupdate", this.currentTime);
 				this.timeUpdateFrameId = requestAnimationFrame(tick);
 			}
 		};

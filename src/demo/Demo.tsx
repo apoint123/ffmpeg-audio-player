@@ -19,11 +19,13 @@ const formatTime = (seconds: number) => {
 export const AudioPlayerDemo: React.FC = () => {
 	const playerRef = useRef<FFmpegAudioPlayer | null>(null);
 	const isDraggingRef = useRef(false);
+	const isSeekingRef = useRef(false);
 
 	const [playerState, setPlayerState] = useState<PlayerState>("idle");
 	const [currentTime, setCurrentTime] = useState(0);
 	const [duration, setDuration] = useState(0);
 	const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
 	const [metadata, setMetadata] = useState<Record<string, string>>({});
 	const [formatInfo, setFormatInfo] = useState<{
 		rate: number;
@@ -33,6 +35,7 @@ export const AudioPlayerDemo: React.FC = () => {
 	} | null>(null);
 	const [coverUrl, setCoverUrl] = useState<string | null>(null);
 	const [volume, setVolume] = useState(1.0);
+
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const animationRef = useRef<number>(0);
 
@@ -49,29 +52,48 @@ export const AudioPlayerDemo: React.FC = () => {
 		const player = new FFmpegAudioPlayer(() => new AudioWorker());
 		playerRef.current = player;
 
-		const handleStateChange = (e: CustomEvent<PlayerState>) => {
-			setPlayerState(e.detail);
-			if (e.detail !== "error") setErrorMsg(null);
+		const handleLoadStart = () => {
+			setPlayerState("loading");
+			setErrorMsg(null);
+		};
 
-			if (e.detail === "ready") {
-				const playerAny = player;
-				const info = playerAny.audioInfo;
-
-				if (info) {
-					setMetadata(info.metadata || {});
-					setCoverUrl(info.coverUrl || null);
-					setFormatInfo({
-						rate: info.sampleRate,
-						ch: info.channels,
-						enc: info.encoding,
-						bit: info.bitsPerSample,
-					});
-				}
+		const handleLoadedMetadata = () => {
+			const info = player.audioInfo;
+			if (info) {
+				setMetadata(info.metadata || {});
+				setCoverUrl(info.coverUrl || null);
+				setFormatInfo({
+					rate: info.sampleRate,
+					ch: info.channels,
+					enc: info.encoding,
+					bit: info.bitsPerSample,
+				});
+				setDuration(info.duration);
 			}
 		};
 
+		const handleCanPlay = () => {
+			setPlayerState((prev) => (prev === "playing" ? "playing" : "ready"));
+		};
+
+		const handlePlay = () => {
+			setPlayerState("playing");
+		};
+
+		const handlePause = () => {
+			setPlayerState("paused");
+		};
+
+		const handleSeeking = () => {
+			isSeekingRef.current = true;
+		};
+
+		const handleSeeked = () => {
+			isSeekingRef.current = false;
+		};
+
 		const handleTimeUpdate = (e: CustomEvent<number>) => {
-			if (!isDraggingRef.current) {
+			if (!isDraggingRef.current && !isSeekingRef.current) {
 				setCurrentTime(e.detail);
 			}
 		};
@@ -86,21 +108,37 @@ export const AudioPlayerDemo: React.FC = () => {
 		};
 
 		const handleEnded = () => {
+			setPlayerState("idle");
 			if (!isDraggingRef.current) setCurrentTime(0);
 		};
 
-		player.addEventListener("stateChange", handleStateChange);
-		player.addEventListener("timeUpdate", handleTimeUpdate);
-		player.addEventListener("durationChange", handleDurationChange);
+		player.addEventListener("loadstart", handleLoadStart);
+		player.addEventListener("loadedmetadata", handleLoadedMetadata);
+		player.addEventListener("canplay", handleCanPlay);
+		player.addEventListener("play", handlePlay);
+		player.addEventListener("playing", handlePlay);
+		player.addEventListener("pause", handlePause);
+		player.addEventListener("seeking", handleSeeking);
+		player.addEventListener("seeked", handleSeeked);
+		player.addEventListener("timeupdate", handleTimeUpdate);
+		player.addEventListener("durationchange", handleDurationChange);
 		player.addEventListener("error", handleError);
 		player.addEventListener("ended", handleEnded);
 
 		return () => {
-			player.removeEventListener("stateChange", handleStateChange);
-			player.removeEventListener("timeUpdate", handleTimeUpdate);
-			player.removeEventListener("durationChange", handleDurationChange);
+			player.removeEventListener("loadstart", handleLoadStart);
+			player.removeEventListener("loadedmetadata", handleLoadedMetadata);
+			player.removeEventListener("canplay", handleCanPlay);
+			player.removeEventListener("play", handlePlay);
+			player.removeEventListener("playing", handlePlay);
+			player.removeEventListener("pause", handlePause);
+			player.removeEventListener("seeking", handleSeeking);
+			player.removeEventListener("seeked", handleSeeked);
+			player.removeEventListener("timeupdate", handleTimeUpdate);
+			player.removeEventListener("durationchange", handleDurationChange);
 			player.removeEventListener("error", handleError);
 			player.removeEventListener("ended", handleEnded);
+
 			player.destroy();
 		};
 	}, []);
@@ -161,7 +199,8 @@ export const AudioPlayerDemo: React.FC = () => {
 		if (!playerRef.current) return;
 		if (playerState === "playing") {
 			playerRef.current.pause();
-		} else if (["ready", "paused", "idle"].includes(playerState)) {
+		} else {
+			// ready, paused, idle, etc.
 			playerRef.current.play();
 		}
 	};
@@ -177,9 +216,7 @@ export const AudioPlayerDemo: React.FC = () => {
 			console.log(`[Demo] Commit seek to ${currentTime}`);
 			playerRef.current.seek(currentTime);
 		}
-		setTimeout(() => {
-			isDraggingRef.current = false;
-		}, 100);
+		isDraggingRef.current = false;
 	};
 
 	const handleVolumeChange = (e: ChangeEvent<HTMLInputElement>) => {

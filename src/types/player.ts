@@ -17,11 +17,20 @@ export interface AudioMetadata {
 }
 
 export interface PlayerEventMap {
-	stateChange: PlayerState;
-	timeUpdate: number;
-	durationChange: number;
-	error: string;
+	loadstart: undefined;
+	loadedmetadata: undefined;
+	canplay: undefined;
+	play: undefined;
+	playing: undefined;
+	pause: undefined;
+	waiting: undefined;
+	seeking: undefined;
+	seeked: undefined;
+	timeupdate: number;
+	durationchange: number;
 	ended: undefined;
+	error: string;
+	emptied: undefined;
 }
 
 export type WorkerRequest =
