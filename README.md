@@ -54,3 +54,7 @@ bun run sync:headers
 > **Note:** Ensure your `.vscode/c_cpp_properties.json` or `compile_commands.json` points to the `cpp/deps_headers` directory.
 
 You can find a react demo in [Demo.tsx](./src/Demo.tsx).
+
+## LICENSE
+
+[GPL v3](./LICENSE)

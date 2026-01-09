@@ -103,6 +103,7 @@ const confFlags = [
 	"--arch=x86_32",
 
 	"--enable-cross-compile",
+	"--enable-gpl",
 	"--disable-asm",
 	"--disable-debug",
 	"--disable-doc",
