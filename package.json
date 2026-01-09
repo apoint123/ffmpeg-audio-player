@@ -22,9 +22,12 @@
 	},
 	"scripts": {
 		"dev": "vite",
-		"build": "tsc -b && vite build",
+		"build": "bun run build:demo && bun run build:wasm",
+		"build:demo": "tsc -b && vite build",
+		"build:wasm": "bun scripts/build.ts",
 		"lint": "biome lint .",
-		"prepublishOnly": "bun run build"
+		"format": "biome format . --write",
+		"sync:headers": "bun scripts/sync-headers.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.3.11",

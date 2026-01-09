@@ -9,17 +9,20 @@ ENV LDFLAGS="-L$INSTALL_DIR/lib"
 ENV PKG_CONFIG_PATH=$INSTALL_DIR/lib/pkgconfig
 
 RUN apt-get update && \
-    apt-get install -y pkg-config autoconf automake libtool make build-essential
+    apt-get install -y pkg-config autoconf automake libtool make build-essential curl unzip
+
+ENV BUN_INSTALL="/root/.bun"
+ENV PATH="$BUN_INSTALL/bin:$PATH"
+RUN curl -fsSL https://bun.sh/install | bash
 
 FROM emsdk-base AS ffmpeg-base
 ADD https://github.com/FFmpeg/FFmpeg.git#$FFMPEG_VERSION /src
 
 FROM ffmpeg-base AS ffmpeg-builder
-COPY scripts/build-ffmpeg.sh /src/build-ffmpeg.sh
+COPY scripts/build-ffmpeg.ts /src/build-ffmpeg.ts
 WORKDIR /src
-RUN sed -i 's/\r$//' /src/build-ffmpeg.sh && \
-    chmod +x /src/build-ffmpeg.sh && \
-    bash -x /src/build-ffmpeg.sh
+
+RUN bun run /src/build-ffmpeg.ts
 
 FROM emsdk-base AS wasm-builder
 

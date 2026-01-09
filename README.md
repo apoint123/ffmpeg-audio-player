@@ -1,115 +1,56 @@
 # FFmpeg Audio Player
 
-A browser-based audio player powered by FFmpeg. Supports a vast array of audio formats.
+A browser-based audio player powered by FFmpeg and WebAssembly. Supports a vast array of audio formats by decoding them off the main thread.
 
 ## 🛠️ Prerequisites
 
 * **Docker**: Required to compile the C++ FFmpeg code to WASM.
-* **Node.js** and **Bun**: For the React frontend demo.
+* **Bun**: Required as the package manager and runtime for build scripts.
 
 ## 🚀 Build & Run
 
-### 1. Compile WASM
+### 1. Install Dependencies
 
-```bash
-chmod +x scripts/build.sh
-
-# Run the build script
-# This compiles the C++ code and places:
-# - decode-audio.js -> src/assets/
-# - decode-audio.wasm -> public/
-./scripts/build.sh
-
-# or bat if you are on Windows:
-./scripts/build.bat
-
-```
-
-### 2. Install Dependencies
+First, install the project dependencies (including the build script tools).
 
 ```bash
 bun install
+
+```
+
+### 2. Compile WASM
+
+We use TypeScript scripts running on Bun to handle the Docker build process. This command will:
+
+1. Build the Docker image with Emscripten and FFmpeg.
+2. Compile the C++ code to WASM.
+3. Place the artifacts (`decode-audio.js` and `decode-audio.wasm`) into the correct directories.
+
+```bash
+# Cross-platform build command (Windows/Linux/macOS)
+bun run build:wasm
+
 ```
 
 ### 3. Run Development Server (Demo)
 
+Start the React demo to test the player.
+
 ```bash
 bun dev
-```
-
-## 🖥️ Usage
-
-### 1. Basic Initialization
-
-To start using the player, you need to instantiate the `FFmpegAudioPlayer` class. You must provide a **worker factory function** that returns a new Web Worker instance. This is required to handle the FFmpeg decoding off the main thread.
-
-```typescript
-import { FFmpegAudioPlayer } from "./FFmpegAudioPlayer";
-// Assuming you are using Vite/Webpack to import the worker
-import AudioWorker from "./workers/audio.worker?worker";
-
-// Initialize the player
-const player = new FFmpegAudioPlayer(() => new AudioWorker());
 
 ```
 
-### 2. Loading and Controlling Audio
+## 💻 C++ Development (Optional)
 
-```typescript
-// Load a file
-const onFileSelected = (file: File) => {
-  player.load(file);
-};
+If you are modifying the C++ code (`cpp/audio-decode.cpp`), you can synchronize the system and FFmpeg headers from the Docker container to your local machine. This enables **IntelliSense** and code completion in editors like VS Code.
 
-// Basic controls
-player.play();           // Start playback
-player.pause();          // Pause playback
-player.seek(30);         // Seek to 30 seconds
-player.setVolume(0.5);   // Set volume (0.0 to 1.0)
+```bash
+# Extracts headers from Docker to cpp/deps_headers/
+bun run sync:headers
 
 ```
 
-### 3. Event Handling
-
-```typescript
-// Listen for state changes (idle, loading, ready, playing, paused, error)
-player.addEventListener("stateChange", (e) => {
-  console.log("Player State:", e.detail);
-});
-
-// Listen for playback time updates
-player.addEventListener("timeUpdate", (e) => {
-  const currentTime = e.detail; // in seconds
-  console.log("Current Time:", currentTime);
-});
-
-// Listen for duration availability
-player.addEventListener("durationChange", (e) => {
-  console.log("Total Duration:", e.detail);
-});
-
-// Listen for errors
-player.addEventListener("error", (e) => {
-  console.error("Player Error:", e.detail);
-});
-
-// Listen for track end
-player.addEventListener("ended", () => {
-  console.log("Playback finished");
-});
-
-```
-
-### 4. Audio Visualization
-
-```typescript
-const analyser = player.analyser;
-if (analyser) {
-  const dataArray = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(dataArray);
-  // Use dataArray to draw on a Canvas...
-}
-
-```
+> **Note:** Ensure your `.vscode/c_cpp_properties.json` or `compile_commands.json` points to the `cpp/deps_headers` directory.
 
 You can find a react demo in [Demo.tsx](./src/Demo.tsx).
