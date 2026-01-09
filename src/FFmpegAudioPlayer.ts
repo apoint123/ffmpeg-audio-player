@@ -24,6 +24,19 @@ export class FFmpegAudioPlayer extends EventTarget {
 	private activeSources: AudioBufferSourceNode[] = [];
 	private isDecodingFinished = false;
 	private targetVolume = 1.0;
+	private currentTempo = 1.0;
+	/** 锚点时刻的 AudioContext 时间 */
+	private anchorWallTime = 0;
+	/** 锚点时刻的 音频资源 时间（00:00） */
+	private anchorSourceTime = 0;
+
+	/** 用于存储 seek 操作的 resolve 函数 */
+	private pendingSeekResolve:
+		| ((value: void | PromiseLike<void>) => void)
+		| null = null;
+
+	/** 标记当前 seek 是否不需要淡入淡出，用于 setTempo/setPitch */
+	private isImmediateSeek = false;
 
 	private timeUpdateFrameId: number = 0;
 	private currentMessageId = 0;
@@ -125,10 +138,20 @@ export class FFmpegAudioPlayer extends EventTarget {
 	public get duration() {
 		return this.metadata?.duration || 0;
 	}
+	/**
+	 * 获取当前的播放进度，单位为秒
+	 */
 	public get currentTime() {
 		if (!this.audioCtx) return 0;
-		const t = this.audioCtx.currentTime - this.timeOffset;
-		return Math.max(0, t);
+
+		// 计算从上一个锚点到现在，现实世界过了多久
+		const wallDelta = this.audioCtx.currentTime - this.anchorWallTime;
+
+		// 乘以倍速，得出音频实际走了多久
+		const currentPosition =
+			this.anchorSourceTime + wallDelta * this.currentTempo;
+
+		return Math.max(0, currentPosition);
 	}
 	public get volume() {
 		return this.targetVolume;
@@ -219,28 +242,52 @@ export class FFmpegAudioPlayer extends EventTarget {
 		}
 	}
 
-	public async seek(time: number) {
+	/**
+	 * 跳转到指定的时间
+	 * @param time 指定的时间，单位为秒
+	 * @param immediate 是否跳过淡入淡出立刻跳转
+	 * @returns 如果跳转操作完成，包括淡入淡出完成，则 resolve
+	 */
+	public async seek(time: number, immediate = false) {
 		if (!this.worker || !this.audioCtx || !this.metadata || !this.masterGain)
 			return;
 
+		if (this.pendingSeekResolve) {
+			this.pendingSeekResolve();
+			this.pendingSeekResolve = null;
+		}
+
 		this.dispatch("seeking");
+		this.isImmediateSeek = immediate;
 
-		this.rampGain(0, SEEK_FADE_DURATION);
-
-		await new Promise((resolve) =>
-			setTimeout(resolve, SEEK_FADE_DURATION * 1000),
-		);
+		if (!immediate) {
+			this.rampGain(0, SEEK_FADE_DURATION);
+			await new Promise((resolve) =>
+				setTimeout(resolve, SEEK_FADE_DURATION * 1000),
+			);
+		} else {
+			this.masterGain.gain.cancelScheduledValues(this.audioCtx.currentTime);
+			this.masterGain.gain.value = 0;
+		}
 
 		this.stopActiveSources();
 		this.activeSources = [];
 		this.currentMessageId = Date.now();
+
+		const seekPromise = new Promise<void>((resolve) => {
+			this.pendingSeekResolve = resolve;
+		});
 
 		this.postToWorker({
 			type: "SEEK",
 			id: this.currentMessageId,
 			seekTime: time,
 		});
+
 		this.isDecodingFinished = false;
+
+		// 等待 Worker 处理完成 (SEEK_DONE事件)
+		await seekPromise;
 
 		this.dispatch("timeupdate", time);
 	}
@@ -253,6 +300,39 @@ export class FFmpegAudioPlayer extends EventTarget {
 		}
 
 		this.dispatch("volumechange", this.targetVolume);
+	}
+
+	public async setTempo(tempo: number) {
+		if (!this.worker || !this.audioCtx) return;
+
+		const trueTime = this.currentTime;
+		this.worker.postMessage({ type: "SET_TEMPO", value: tempo });
+		this.currentTempo = tempo;
+		await this.seek(trueTime, true);
+	}
+
+	public async setPitch(pitch: number) {
+		if (!this.worker || !this.audioCtx) return;
+
+		const trueTime = this.currentTime;
+		this.worker.postMessage({ type: "SET_PITCH", value: pitch });
+		await this.seek(trueTime, true);
+	}
+
+	/**
+	 * 原子操作：同时重置倍速和音调，只执行一次 Seek
+	 */
+	public async resetTempoAndPitch() {
+		if (!this.worker || !this.audioCtx) return;
+
+		const trueTime = this.currentTime;
+
+		this.currentTempo = 1.0;
+
+		this.worker.postMessage({ type: "SET_TEMPO", value: 1.0 });
+		this.worker.postMessage({ type: "SET_PITCH", value: 1.0 });
+
+		await this.seek(trueTime, true);
 	}
 
 	private stopActiveSources() {
@@ -303,6 +383,11 @@ export class FFmpegAudioPlayer extends EventTarget {
 		this.dispatch("emptied");
 	}
 
+	private syncTimeAnchor(wallTime: number, sourceTime: number) {
+		this.anchorWallTime = wallTime;
+		this.anchorSourceTime = sourceTime;
+	}
+
 	private rampGain(target: number, duration: number) {
 		if (!this.masterGain || !this.audioCtx) return;
 
@@ -336,7 +421,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 					};
 					if (this.audioCtx) {
 						const now = this.audioCtx.currentTime;
-						this.timeOffset = now;
+						this.syncTimeAnchor(now, 0);
 						this.nextStartTime = now;
 					}
 					this.dispatch("durationchange", resp.duration);
@@ -374,19 +459,29 @@ export class FFmpegAudioPlayer extends EventTarget {
 						const now = this.audioCtx.currentTime;
 						this.isWorkerPaused = false;
 						this.nextStartTime = now;
-						this.timeOffset = now - resp.time;
+						this.syncTimeAnchor(now, resp.time);
 
 						if (this.playerState === "playing") {
 							this.masterGain.gain.cancelScheduledValues(now);
-							this.masterGain.gain.setValueAtTime(0, now);
-							this.masterGain.gain.linearRampToValueAtTime(
-								this.targetVolume,
-								now + SEEK_FADE_DURATION,
-							);
+
+							if (this.isImmediateSeek) {
+								this.masterGain.gain.setValueAtTime(this.targetVolume, now);
+							} else {
+								this.masterGain.gain.setValueAtTime(0, now);
+								this.masterGain.gain.linearRampToValueAtTime(
+									this.targetVolume,
+									now + SEEK_FADE_DURATION,
+								);
+							}
 						}
 					}
+
 					this.dispatch("seeked");
 
+					if (this.pendingSeekResolve) {
+						this.pendingSeekResolve();
+						this.pendingSeekResolve = null;
+					}
 					break;
 			}
 		};
@@ -418,7 +513,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 			this.nextStartTime = now;
 		}
 
-		this.timeOffset = this.nextStartTime - chunkStartTime;
+		this.syncTimeAnchor(this.nextStartTime, chunkStartTime);
 
 		const source = ctx.createBufferSource();
 		source.buffer = audioBuffer;

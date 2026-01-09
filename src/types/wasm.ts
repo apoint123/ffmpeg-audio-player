@@ -48,6 +48,9 @@ export interface AudioStreamDecoder extends EmbindObject {
 	readChunk(chunkSize: number): ChunkResult;
 	seek(timestamp: number): DecoderStatus;
 	close(): void;
+	setTempo(tempo: number): void;
+	setPitch(pitch: number): void;
+	delete(): void;
 }
 
 export interface AudioDecoderModule extends EmscriptenModule {

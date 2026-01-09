@@ -34,7 +34,11 @@ export const AudioPlayerDemo: React.FC = () => {
 		bit: number;
 	} | null>(null);
 	const [coverUrl, setCoverUrl] = useState<string | null>(null);
+
 	const [volume, setVolume] = useState(1.0);
+	const [tempo, setTempo] = useState(1.0);
+	const [pitch, setPitch] = useState(1.0);
+	const [isUpdating, setIsUpdating] = useState(false);
 
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const animationRef = useRef<number>(0);
@@ -191,6 +195,8 @@ export const AudioPlayerDemo: React.FC = () => {
 			setMetadata({});
 			setCoverUrl(null);
 			setFormatInfo(null);
+			setTempo(1.0);
+			setPitch(1.0);
 			playerRef.current.load(file);
 		}
 	};
@@ -224,6 +230,56 @@ export const AudioPlayerDemo: React.FC = () => {
 		setVolume(newVolume);
 		if (playerRef.current) {
 			playerRef.current.setVolume(newVolume);
+		}
+	};
+
+	const handleTempoChange = (e: ChangeEvent<HTMLInputElement>) => {
+		setTempo(Number(e.target.value));
+	};
+
+	const handleTempoCommit = async () => {
+		if (playerRef.current && !isUpdating) {
+			try {
+				setIsUpdating(true);
+				await playerRef.current.setTempo(tempo);
+			} catch (e) {
+				console.error("Tempo update failed", e);
+			} finally {
+				setIsUpdating(false);
+			}
+		}
+	};
+
+	const handlePitchChange = (e: ChangeEvent<HTMLInputElement>) => {
+		setPitch(Number(e.target.value));
+	};
+
+	const handlePitchCommit = async () => {
+		if (playerRef.current && !isUpdating) {
+			try {
+				setIsUpdating(true);
+				await playerRef.current.setPitch(pitch);
+			} catch (e) {
+				console.error("Pitch update failed", e);
+			} finally {
+				setIsUpdating(false);
+			}
+		}
+	};
+
+	const resetTempoPitch = async () => {
+		if (playerRef.current && !isUpdating) {
+			setTempo(1.0);
+			setPitch(1.0);
+
+			try {
+				setIsUpdating(true);
+				await playerRef.current.resetTempoAndPitch();
+			} catch (e) {
+				console.error("Reset failed", e);
+			} finally {
+				setIsUpdating(false);
+			}
 		}
 	};
 
@@ -331,27 +387,90 @@ export const AudioPlayerDemo: React.FC = () => {
 			<div
 				style={{
 					marginTop: "15px",
-					display: "flex",
-					alignItems: "center",
-					gap: "10px",
-					padding: "10px",
+					padding: "15px",
 					background: "#f0f0f0",
 					borderRadius: "8px",
+					display: "flex",
+					flexDirection: "column",
+					gap: "15px",
 				}}
 			>
-				<span style={{ fontSize: "14px", fontWeight: "bold" }}>Volume:</span>
-				<input
-					type="range"
-					min={0}
-					max={1}
-					step={0.01}
-					value={volume}
-					onChange={handleVolumeChange}
-					style={{ cursor: "pointer", flex: 1 }}
-				/>
-				<span style={{ fontSize: "12px", width: "35px" }}>
-					{Math.round(volume * 100)}%
-				</span>
+				<div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+					<span style={{ fontSize: "14px", fontWeight: "bold", width: "60px" }}>
+						Volume:
+					</span>
+					<input
+						type="range"
+						min={0}
+						max={1}
+						step={0.01}
+						value={volume}
+						onChange={handleVolumeChange}
+						style={{ cursor: "pointer", flex: 1 }}
+					/>
+					<span style={{ fontSize: "12px", width: "35px", textAlign: "right" }}>
+						{Math.round(volume * 100)}%
+					</span>
+				</div>
+
+				<div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+					<span style={{ fontSize: "14px", fontWeight: "bold", width: "60px" }}>
+						Tempo:
+					</span>
+					<input
+						type="range"
+						min={0.5}
+						max={2.0}
+						step={0.05}
+						value={tempo}
+						onChange={handleTempoChange}
+						onMouseUp={handleTempoCommit}
+						onTouchEnd={handleTempoCommit}
+						style={{ cursor: "pointer", flex: 1 }}
+					/>
+					<span style={{ fontSize: "12px", width: "35px", textAlign: "right" }}>
+						{tempo.toFixed(2)}x
+					</span>
+				</div>
+
+				<div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+					<span style={{ fontSize: "14px", fontWeight: "bold", width: "60px" }}>
+						Pitch:
+					</span>
+					<input
+						type="range"
+						min={0.5}
+						max={2.0}
+						step={0.05}
+						value={pitch}
+						onChange={handlePitchChange}
+						onMouseUp={handlePitchCommit}
+						onTouchEnd={handlePitchCommit}
+						style={{ cursor: "pointer", flex: 1 }}
+					/>
+					<span style={{ fontSize: "12px", width: "35px", textAlign: "right" }}>
+						{pitch.toFixed(2)}x
+					</span>
+				</div>
+
+				{(tempo !== 1.0 || pitch !== 1.0) && (
+					<div style={{ textAlign: "center" }}>
+						<button
+							type="button"
+							onClick={resetTempoPitch}
+							style={{
+								padding: "5px 10px",
+								fontSize: "12px",
+								cursor: "pointer",
+								background: "#fff",
+								border: "1px solid #ccc",
+								borderRadius: "4px",
+							}}
+						>
+							Reset Speed & Pitch
+						</button>
+					</div>
+				)}
 			</div>
 
 			<div

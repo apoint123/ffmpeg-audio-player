@@ -168,6 +168,14 @@ class DecoderSession {
 		}
 	}
 
+	public setTempo(tempo: number) {
+		this.decoder?.setTempo(tempo);
+	}
+
+	public setPitch(pitch: number) {
+		this.decoder?.setPitch(pitch);
+	}
+
 	public destroy() {
 		this.isRunning = false;
 
@@ -236,6 +244,16 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 		case "SEEK":
 			if (currentSession) {
 				currentSession.seek(req.seekTime, req.id);
+			}
+			break;
+		case "SET_TEMPO":
+			if (currentSession) {
+				currentSession.setTempo(req.value);
+			}
+			break;
+		case "SET_PITCH":
+			if (currentSession) {
+				currentSession.setPitch(req.value);
 			}
 			break;
 	}

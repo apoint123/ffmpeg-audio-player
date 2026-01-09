@@ -19,6 +19,8 @@ extern "C"
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
 
+#include "SoundTouch.h"
+
 using namespace emscripten;
 
 struct Status
@@ -141,7 +143,7 @@ public:
         {
             reset();
             int ret = av_samples_alloc_array_and_samples(
-                &m_data, &m_linesize, channels, required_samples, AV_SAMPLE_FMT_FLTP, 0);
+                &m_data, &m_linesize, channels, required_samples, AV_SAMPLE_FMT_FLT, 0);
             if (ret < 0)
                 return nullptr;
             m_allocated_samples = required_samples;
@@ -162,6 +164,12 @@ private:
     PacketPtr packet;
     FramePtr frame;
     SwrCtxPtr swr_ctx;
+
+    // SoundTouch 实例
+    soundtouch::SoundTouch m_soundTouch;
+
+    // 用于从 SoundTouch 接收交错数据的临时 buffer
+    std::vector<float> m_st_receive_buffer;
 
     AudioSampleBuffer resample_buffer;
 
@@ -184,6 +192,16 @@ public:
     AudioStreamDecoder() {}
 
     ~AudioStreamDecoder() = default;
+
+    void setTempo(double tempo)
+    {
+        m_soundTouch.setTempo(tempo);
+    }
+
+    void setPitch(double pitch)
+    {
+        m_soundTouch.setPitch(pitch);
+    }
 
     AudioProperties init(std::string path)
     {
@@ -231,6 +249,12 @@ public:
             return {status};
         }
 
+        m_soundTouch.setSampleRate(codec_ctx->sample_rate);
+        m_soundTouch.setChannels(codec_ctx->ch_layout.nb_channels);
+        m_soundTouch.setTempo(1.0);
+        m_soundTouch.setPitch(1.0);
+        m_soundTouch.setRate(1.0);
+
         swr_ctx.reset(swr_alloc());
 
         av_opt_set_chlayout(swr_ctx.get(), "in_chlayout", &codec_ctx->ch_layout, 0);
@@ -239,7 +263,7 @@ public:
 
         av_opt_set_chlayout(swr_ctx.get(), "out_chlayout", &codec_ctx->ch_layout, 0);
         av_opt_set_int(swr_ctx.get(), "out_sample_rate", codec_ctx->sample_rate, 0);
-        av_opt_set_sample_fmt(swr_ctx.get(), "out_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
+        av_opt_set_sample_fmt(swr_ctx.get(), "out_sample_fmt", AV_SAMPLE_FMT_FLT, 0);
 
         if ((status.status = swr_init(swr_ctx.get())) < 0)
         {
@@ -336,10 +360,46 @@ public:
             buf.reserve(chunkSize);
         }
 
-        int current_samples = 0;
+        int current_output_samples = 0;
+        bool decode_done = false;
 
-        while (current_samples < chunkSize)
+        while (current_output_samples < chunkSize)
         {
+            int needed_frames = chunkSize - current_output_samples;
+
+            if (m_st_receive_buffer.size() < needed_frames * output_channels)
+            {
+                m_st_receive_buffer.resize(needed_frames * output_channels);
+            }
+
+            int received_frames = m_soundTouch.receiveSamples(m_st_receive_buffer.data(), needed_frames);
+
+            if (received_frames > 0)
+            {
+                const float *ptr = m_st_receive_buffer.data();
+                for (int i = 0; i < received_frames; i++)
+                {
+                    for (int ch = 0; ch < output_channels; ch++)
+                    {
+                        m_staging_buffers[ch].push_back(*ptr++);
+                    }
+                }
+                current_output_samples += received_frames;
+
+                if (current_output_samples >= chunkSize)
+                    break;
+            }
+
+            if (decode_done)
+            {
+                if (received_frames == 0)
+                {
+                    result.isEOF = true;
+                    break;
+                }
+                continue;
+            }
+
             int receive_ret = avcodec_receive_frame(codec_ctx.get(), frame.get());
 
             if (receive_ret == 0)
@@ -401,18 +461,10 @@ public:
 
                 if (ret > 0)
                 {
-                    for (int ch = 0; ch < output_channels; ch++)
-                    {
-                        auto &ch_buf = m_staging_buffers[ch];
-                        size_t old_size = ch_buf.size();
-                        ch_buf.resize(old_size + ret);
-                        memcpy(ch_buf.data() + old_size, out_data[ch], ret * sizeof(float));
-                    }
-                    current_samples += ret;
+                    m_soundTouch.putSamples((const float *)out_data[0], ret);
                 }
 
                 av_frame_unref(frame.get());
-                continue;
             }
             else if (receive_ret == AVERROR_EOF)
             {
@@ -427,67 +479,57 @@ public:
                         int ret = swr_convert(swr_ctx.get(), out_data, dst_nb_samples, nullptr, 0);
                         if (ret > 0)
                         {
-                            for (int ch = 0; ch < output_channels; ch++)
-                            {
-                                auto &ch_buf = m_staging_buffers[ch];
-                                size_t old_size = ch_buf.size();
-                                ch_buf.resize(old_size + ret);
-                                memcpy(ch_buf.data() + old_size, out_data[ch], ret * sizeof(float));
-                            }
-                            current_samples += ret;
+                            m_soundTouch.putSamples((const float *)out_data[0], ret);
                         }
                     }
                 }
-                result.isEOF = true;
-                break;
+
+                m_soundTouch.flush();
+                decode_done = true;
             }
             else if (receive_ret != AVERROR(EAGAIN))
             {
                 result.status = {receive_ret, "Receive frame error: " + get_error_str(receive_ret)};
                 break;
             }
-
-            int read_ret = av_read_frame(format_ctx.get(), packet.get());
-            if (read_ret < 0)
+            else
             {
-                if (read_ret == AVERROR_EOF)
+                int read_ret = av_read_frame(format_ctx.get(), packet.get());
+                if (read_ret < 0)
                 {
-                    avcodec_send_packet(codec_ctx.get(), nullptr);
-                    continue;
+                    if (read_ret == AVERROR_EOF)
+                    {
+                        avcodec_send_packet(codec_ctx.get(), nullptr);
+                    }
+                    else
+                    {
+                        result.status = {read_ret, "Read frame error: " + get_error_str(read_ret)};
+                        break;
+                    }
                 }
                 else
                 {
-                    result.status = {read_ret, "Read frame error: " + get_error_str(read_ret)};
-                    break;
-                }
-            }
-
-            if (packet->stream_index == audio_stream_index)
-            {
-                int send_ret = avcodec_send_packet(codec_ctx.get(), packet.get());
-                if (send_ret < 0 && send_ret != AVERROR(EAGAIN) && send_ret != AVERROR_EOF)
-                {
+                    if (packet->stream_index == audio_stream_index)
+                    {
+                        avcodec_send_packet(codec_ctx.get(), packet.get());
+                    }
                     av_packet_unref(packet.get());
-                    result.status = {send_ret, "Send packet error: " + get_error_str(send_ret)};
-                    break;
                 }
             }
-            av_packet_unref(packet.get());
         }
 
         // 把数据打平成 AudioBuffer 声道需要的 LLL...RRR... Planer 格式
-        int total_samples_all_channels = current_samples * output_channels;
-
-        m_pcm_output.clear();
+        int total_samples_all_channels = current_output_samples * output_channels;
         m_pcm_output.resize(total_samples_all_channels);
 
         float *dst_ptr = m_pcm_output.data();
-
         for (int ch = 0; ch < output_channels; ch++)
         {
-            size_t copy_count = m_staging_buffers[ch].size();
-            memcpy(dst_ptr, m_staging_buffers[ch].data(), copy_count * sizeof(float));
-            dst_ptr += copy_count;
+            if (m_staging_buffers[ch].size() > 0)
+            {
+                memcpy(dst_ptr, m_staging_buffers[ch].data(), current_output_samples * sizeof(float));
+            }
+            dst_ptr += current_output_samples;
         }
 
         result.samples = emscripten::val(
@@ -513,6 +555,8 @@ public:
         }
 
         avcodec_flush_buffers(codec_ctx.get());
+
+        m_soundTouch.clear();
 
         // Seek 后重置预测时钟为 NOPTS，强制让下一帧的真实 PTS 来校准
         m_next_pts = AV_NOPTS_VALUE;
@@ -571,5 +615,7 @@ EMSCRIPTEN_BINDINGS(my_module)
         .function("init", &AudioStreamDecoder::init)
         .function("readChunk", &AudioStreamDecoder::readChunk)
         .function("seek", &AudioStreamDecoder::seek)
-        .function("close", &AudioStreamDecoder::close);
+        .function("close", &AudioStreamDecoder::close)
+        .function("setTempo", &AudioStreamDecoder::setTempo)
+        .function("setPitch", &AudioStreamDecoder::setPitch);
 }

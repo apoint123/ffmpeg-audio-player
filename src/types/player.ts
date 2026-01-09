@@ -38,7 +38,9 @@ export type WorkerRequest =
 	| { type: "INIT"; id: number; file: File; chunkSize: number }
 	| { type: "PAUSE"; id: number }
 	| { type: "RESUME"; id: number }
-	| { type: "SEEK"; id: number; seekTime: number };
+	| { type: "SEEK"; id: number; seekTime: number }
+	| { type: "SET_TEMPO"; value: number }
+	| { type: "SET_PITCH"; value: number };
 
 export type WorkerResponse =
 	| { type: "ERROR"; id: number; error: string }
