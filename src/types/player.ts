@@ -40,7 +40,8 @@ export type WorkerRequest =
 	| { type: "RESUME"; id: number }
 	| { type: "SEEK"; id: number; seekTime: number }
 	| { type: "SET_TEMPO"; value: number }
-	| { type: "SET_PITCH"; value: number };
+	| { type: "SET_PITCH"; value: number }
+	| { type: "EXPORT_WAV"; id: number; file: File };
 
 export type WorkerResponse =
 	| { type: "ERROR"; id: number; error: string }
@@ -63,4 +64,5 @@ export type WorkerResponse =
 			startTime: number;
 	  }
 	| { type: "EOF"; id: number }
-	| { type: "SEEK_DONE"; id: number; time: number };
+	| { type: "SEEK_DONE"; id: number; time: number }
+	| { type: "EXPORT_WAV_DONE"; id: number; blob: Blob };

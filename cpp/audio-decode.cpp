@@ -41,6 +41,12 @@ struct AudioProperties
     int bits_per_sample;
 };
 
+enum class SampleFormat
+{
+    PlanarF32 = 0,
+    InterleavedS16 = 1
+};
+
 struct ChunkResult
 {
     Status status;
@@ -177,6 +183,9 @@ private:
     bool initialized = false;
 
     std::vector<float> pcm_buffer;
+
+    // 用于存储交错的 Int16 数据
+    std::vector<int16_t> m_s16_output;
 
     // 用于暂存每个通道的 Planar 数据
     std::vector<std::vector<float>> m_staging_buffers;
@@ -333,7 +342,7 @@ public:
         };
     }
 
-    ChunkResult readChunk(int chunkSize)
+    ChunkResult readChunk(int chunkSize, SampleFormat format = SampleFormat::PlanarF32)
     {
         if (!initialized || !swr_ctx)
             return {
@@ -518,22 +527,51 @@ public:
             }
         }
 
-        // 把数据打平成 AudioBuffer 声道需要的 LLL...RRR... Planer 格式
-        int total_samples_all_channels = current_output_samples * output_channels;
-        m_pcm_output.resize(total_samples_all_channels);
-
-        float *dst_ptr = m_pcm_output.data();
-        for (int ch = 0; ch < output_channels; ch++)
+        // Interleaved Int16 格式
+        if (format == SampleFormat::InterleavedS16)
         {
-            if (m_staging_buffers[ch].size() > 0)
-            {
-                memcpy(dst_ptr, m_staging_buffers[ch].data(), current_output_samples * sizeof(float));
-            }
-            dst_ptr += current_output_samples;
-        }
+            int total_samples = current_output_samples * output_channels;
+            m_s16_output.resize(total_samples);
 
-        result.samples = emscripten::val(
-            emscripten::memory_view<float>(m_pcm_output.size(), m_pcm_output.data()));
+            int16_t *dst_ptr = m_s16_output.data();
+
+            for (int i = 0; i < current_output_samples; i++)
+            {
+                for (int ch = 0; ch < output_channels; ch++)
+                {
+                    float sample = m_staging_buffers[ch][i];
+
+                    if (sample < -1.0f)
+                        sample = -1.0f;
+                    else if (sample > 1.0f)
+                        sample = 1.0f;
+
+                    *dst_ptr++ = static_cast<int16_t>(sample * 32767.0f);
+                }
+            }
+
+            result.samples = emscripten::val(
+                emscripten::memory_view<int16_t>(m_s16_output.size(), m_s16_output.data()));
+        }
+        else
+        // LLL... RRR... Planer 格式
+        {
+            int total_samples_all_channels = current_output_samples * output_channels;
+            m_pcm_output.resize(total_samples_all_channels);
+
+            float *dst_ptr = m_pcm_output.data();
+            for (int ch = 0; ch < output_channels; ch++)
+            {
+                if (m_staging_buffers[ch].size() > 0)
+                {
+                    memcpy(dst_ptr, m_staging_buffers[ch].data(), current_output_samples * sizeof(float));
+                }
+                dst_ptr += current_output_samples;
+            }
+
+            result.samples = emscripten::val(
+                emscripten::memory_view<float>(m_pcm_output.size(), m_pcm_output.data()));
+        }
 
         return result;
     }
@@ -581,6 +619,7 @@ public:
         }
         m_staging_buffers.clear();
         std::vector<float>().swap(m_pcm_output);
+        std::vector<int16_t>().swap(m_s16_output);
     }
 };
 
@@ -603,6 +642,10 @@ EMSCRIPTEN_BINDINGS(my_module)
         .field("metadata", &AudioProperties::metadata)
         .field("coverArt", &AudioProperties::cover_art)
         .field("bitsPerSample", &AudioProperties::bits_per_sample);
+
+    enum_<SampleFormat>("SampleFormat")
+        .value("PlanarF32", SampleFormat::PlanarF32)
+        .value("InterleavedS16", SampleFormat::InterleavedS16);
 
     value_object<ChunkResult>("ChunkResult")
         .field("status", &ChunkResult::status)

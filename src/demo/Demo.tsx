@@ -43,6 +43,9 @@ export const AudioPlayerDemo: React.FC = () => {
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const animationRef = useRef<number>(0);
 
+	const [currentFile, setCurrentFile] = useState<File | null>(null);
+	const [isExporting, setIsExporting] = useState(false);
+
 	useEffect(() => {
 		return () => {
 			if (coverUrl) {
@@ -189,6 +192,7 @@ export const AudioPlayerDemo: React.FC = () => {
 	const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
 		const file = e.target.files?.[0];
 		if (file && playerRef.current) {
+			setCurrentFile(file);
 			setErrorMsg(null);
 			setCurrentTime(0);
 			setDuration(0);
@@ -280,6 +284,32 @@ export const AudioPlayerDemo: React.FC = () => {
 			} finally {
 				setIsUpdating(false);
 			}
+		}
+	};
+
+	const handleExport = async () => {
+		if (!playerRef.current || !currentFile || isExporting) return;
+
+		try {
+			setIsExporting(true);
+			const blob = await playerRef.current.exportAsWav(currentFile);
+
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			const fileName = `${currentFile.name.replace(/\.[^/.]+$/, "")}.wav`;
+			a.download = fileName;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+
+			console.log("导出成功");
+		} catch (err) {
+			console.error("导出失败", err);
+			setErrorMsg(`Export failed: ${(err as Error).message}`);
+		} finally {
+			setIsExporting(false);
 		}
 	};
 
@@ -471,6 +501,46 @@ export const AudioPlayerDemo: React.FC = () => {
 						</button>
 					</div>
 				)}
+			</div>
+
+			<div
+				style={{
+					marginTop: "15px",
+					padding: "15px",
+					background: "#e3f2fd",
+					borderRadius: "8px",
+					display: "flex",
+					justifyContent: "space-between",
+					alignItems: "center",
+				}}
+			>
+				<div>
+					<strong style={{ fontSize: "14px", color: "#0d47a1" }}>
+						Format Conversion
+					</strong>
+					<div style={{ fontSize: "12px", color: "#555", marginTop: "4px" }}>
+						Convert current file to WAV (Interleaved Int16)
+					</div>
+				</div>
+
+				<button
+					type="button"
+					onClick={handleExport}
+					disabled={!currentFile || isExporting}
+					style={{
+						padding: "8px 16px",
+						fontSize: "14px",
+						fontWeight: "bold",
+						color: "white",
+						background: isExporting ? "#90caf9" : "#1976d2",
+						border: "none",
+						borderRadius: "4px",
+						cursor: isExporting || !currentFile ? "not-allowed" : "pointer",
+						transition: "background 0.2s",
+					}}
+				>
+					{isExporting ? "Converting..." : "Export to WAV"}
+				</button>
 			</div>
 
 			<div

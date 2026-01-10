@@ -43,6 +43,11 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 	public analyser: AnalyserNode | null = null;
 
+	private pendingExports = new Map<
+		number,
+		{ resolve: (blob: Blob) => void; reject: (err: Error) => void }
+	>();
+
 	constructor(private workerFactory: () => Worker) {
 		super();
 	}
@@ -335,6 +340,24 @@ export class FFmpegAudioPlayer extends EventTarget {
 		await this.seek(trueTime, true);
 	}
 
+	public async exportAsWav(file: File) {
+		if (!this.worker) {
+			throw new Error("Worker not initialized");
+		}
+
+		const exportId = Date.now();
+
+		return new Promise<Blob>((resolve, reject) => {
+			this.pendingExports.set(exportId, { resolve, reject });
+
+			this.worker?.postMessage({
+				type: "EXPORT_WAV",
+				id: exportId,
+				file: file,
+			});
+		});
+	}
+
 	private stopActiveSources() {
 		this.activeSources.forEach((source) => {
 			try {
@@ -403,6 +426,20 @@ export class FFmpegAudioPlayer extends EventTarget {
 
 		this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
 			const resp = event.data;
+			const pendingExport = this.pendingExports.get(resp.id);
+
+			if (pendingExport) {
+				if (resp.type === "EXPORT_WAV_DONE") {
+					pendingExport.resolve(resp.blob);
+					this.pendingExports.delete(resp.id);
+					return;
+				} else if (resp.type === "ERROR") {
+					pendingExport.reject(new Error(resp.error));
+					this.pendingExports.delete(resp.id);
+					return;
+				}
+			}
+
 			if (resp.id !== this.currentMessageId) return;
 
 			switch (resp.type) {

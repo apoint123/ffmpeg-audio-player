@@ -103,14 +103,15 @@ class DecoderSession {
 		if (this.isPaused || !this.decoder) return;
 
 		try {
-			const result = this.decoder.readChunk(this.req.chunkSize);
+			const FORMAT_F32 = this.module.SampleFormat.PlanarF32;
+			const result = this.decoder.readChunk(this.req.chunkSize, FORMAT_F32);
 
 			if (result.status.status < 0) {
 				throw new Error(`Decode error: ${result.status.error}`);
 			}
 
 			if (result.samples.length > 0) {
-				const chunkData = result.samples.slice();
+				const chunkData = result.samples.slice() as Float32Array;
 				this.post(
 					{
 						type: "CHUNK",
@@ -209,6 +210,121 @@ class DecoderSession {
 	}
 }
 
+async function handleExportWav(req: WorkerRequest & { type: "EXPORT_WAV" }) {
+	const module = await getModule();
+	const mountDir = `/export_${req.id}`;
+	let decoder: AudioStreamDecoder | null = null;
+
+	try {
+		try {
+			module.FS.mkdir(mountDir);
+			module.FS.mount(
+				module.FS.filesystems.WORKERFS,
+				{ files: [req.file] },
+				mountDir,
+			);
+		} catch {
+			// 忽略目录已存在错误
+		}
+
+		decoder = new module.AudioStreamDecoder();
+		const filePath = `${mountDir}/${req.file.name}`;
+		const props = decoder.init(filePath);
+
+		if (props.status.status < 0) {
+			throw new Error(`Export init failed: ${props.status.error}`);
+		}
+
+		const chunks: Int16Array[] = [];
+		const CHUNK_SIZE = 4096 * 16;
+		const FORMAT_S16 = module.SampleFormat.InterleavedS16;
+
+		while (true) {
+			const result = decoder.readChunk(CHUNK_SIZE, FORMAT_S16);
+
+			if (result.status.status < 0) {
+				throw new Error(`Export decode error: ${result.status.error}`);
+			}
+
+			if (result.samples.length > 0) {
+				chunks.push(result.samples.slice() as Int16Array);
+			}
+
+			if (result.isEOF) break;
+		}
+
+		const totalSamples = chunks.reduce((acc, curr) => acc + curr.length, 0);
+		const dataByteLength = totalSamples * 2; // Int16 = 2 bytes
+
+		const wavHeader = createWavHeader(
+			props.sampleRate,
+			props.channelCount,
+			dataByteLength,
+		);
+
+		const blob = new Blob([wavHeader, ...chunks] as BlobPart[], {
+			type: "audio/wav",
+		});
+
+		self.postMessage({
+			type: "EXPORT_WAV_DONE",
+			id: req.id,
+			blob: blob,
+		});
+	} catch (e) {
+		self.postMessage({
+			type: "ERROR",
+			id: req.id,
+			error: (e as Error).message,
+		});
+	} finally {
+		if (decoder) {
+			decoder.close();
+			decoder.delete();
+		}
+		try {
+			module.FS.unmount(mountDir);
+			module.FS.rmdir(mountDir);
+		} catch {}
+	}
+}
+
+function createWavHeader(
+	sampleRate: number,
+	channels: number,
+	dataLength: number,
+): Uint8Array {
+	const buffer = new ArrayBuffer(44);
+	const view = new DataView(buffer);
+
+	// RIFF chunk descriptor
+	writeString(view, 0, "RIFF");
+	view.setUint32(4, 36 + dataLength, true); // File size - 8
+	writeString(view, 8, "WAVE");
+
+	// fmt sub-chunk
+	writeString(view, 12, "fmt ");
+	view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+	view.setUint16(20, 1, true); // AudioFormat (1 = PCM)
+	view.setUint16(22, channels, true);
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * channels * 2, true); // ByteRate
+	view.setUint16(32, channels * 2, true); // BlockAlign
+	view.setUint16(34, 16, true); // BitsPerSample
+
+	// data sub-chunk
+	writeString(view, 36, "data");
+	view.setUint32(40, dataLength, true);
+
+	return new Uint8Array(buffer);
+}
+
+function writeString(view: DataView, offset: number, string: string) {
+	for (let i = 0; i < string.length; i++) {
+		view.setUint8(offset + i, string.charCodeAt(i));
+	}
+}
+
 let currentSession: DecoderSession | null = null;
 
 self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
@@ -255,6 +371,9 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 			if (currentSession) {
 				currentSession.setPitch(req.value);
 			}
+			break;
+		case "EXPORT_WAV":
+			handleExportWav(req);
 			break;
 	}
 };
