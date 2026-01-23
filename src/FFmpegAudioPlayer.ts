@@ -1,3 +1,4 @@
+import { type GetDetail, TypedEventTarget } from "./TypedEventTarget";
 import type {
 	AudioMetadata,
 	PlayerEventMap,
@@ -11,7 +12,11 @@ const LOW_WATER_MARK = 10;
 const FADE_DURATION = 0.15;
 const SEEK_FADE_DURATION = 0.05;
 
-export class FFmpegAudioPlayer extends EventTarget {
+type FFmpegPlayerEventMap = {
+	[K in keyof PlayerEventMap]: CustomEvent<PlayerEventMap[K]>;
+};
+
+export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	private worker: Worker | null = null;
 	private audioCtx: AudioContext | null = null;
 	private masterGain: GainNode | null = null;
@@ -52,60 +57,12 @@ export class FFmpegAudioPlayer extends EventTarget {
 		super();
 	}
 
-	public override addEventListener<K extends keyof PlayerEventMap>(
+	public override dispatch<K extends keyof FFmpegPlayerEventMap>(
 		type: K,
-		listener: (ev: CustomEvent<PlayerEventMap[K]>) => void,
-		options?: boolean | AddEventListenerOptions,
-	): void;
-	public override addEventListener(
-		type: string,
-		listener: EventListenerOrEventListenerObject | null,
-		options?: boolean | AddEventListenerOptions,
-	): void;
-	public override addEventListener(
-		type: string,
-		listener:
-			| EventListenerOrEventListenerObject
-			| ((ev: CustomEvent<unknown>) => void)
-			| null,
-		options?: boolean | AddEventListenerOptions,
-	): void {
-		super.addEventListener(
-			type,
-			listener as EventListenerOrEventListenerObject,
-			options,
-		);
-	}
-
-	public override removeEventListener<K extends keyof PlayerEventMap>(
-		type: K,
-		listener: (ev: CustomEvent<PlayerEventMap[K]>) => void,
-		options?: boolean | EventListenerOptions,
-	): void;
-	public override removeEventListener(
-		type: string,
-		listener: EventListenerOrEventListenerObject | null,
-		options?: boolean | EventListenerOptions,
-	): void;
-	public override removeEventListener(
-		type: string,
-		listener:
-			| EventListenerOrEventListenerObject
-			| ((ev: CustomEvent<unknown>) => void)
-			| null,
-		options?: boolean | EventListenerOptions,
-	): void {
-		super.removeEventListener(
-			type,
-			listener as EventListenerOrEventListenerObject,
-			options,
-		);
-	}
-
-	private dispatch<K extends keyof PlayerEventMap>(
-		type: K,
-		detail?: PlayerEventMap[K],
-	) {
+		...args: GetDetail<FFmpegPlayerEventMap[K]> extends undefined
+			? [detail?: GetDetail<FFmpegPlayerEventMap[K]>]
+			: [detail: GetDetail<FFmpegPlayerEventMap[K]>]
+	): boolean {
 		switch (type) {
 			case "loadstart":
 				this.playerState = "loading";
@@ -133,8 +90,7 @@ export class FFmpegAudioPlayer extends EventTarget {
 				break;
 		}
 
-		const event = new CustomEvent(type, { detail });
-		this.dispatchEvent(event);
+		return super.dispatch(type, ...args);
 	}
 
 	public get state() {
