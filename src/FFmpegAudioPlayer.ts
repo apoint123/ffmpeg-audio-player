@@ -1,4 +1,3 @@
-import { type GetDetail, TypedEventTarget } from "./TypedEventTarget";
 import type {
 	AudioMetadata,
 	PlayerEventMap,
@@ -6,11 +5,14 @@ import type {
 	WorkerRequest,
 	WorkerResponse,
 } from "./types";
+import { SharedRingBuffer } from "./utils/SharedRingBuffer";
+import { type GetDetail, TypedEventTarget } from "./utils/TypedEventTarget";
 
 const HIGH_WATER_MARK = 30;
 const LOW_WATER_MARK = 10;
 const FADE_DURATION = 0.15;
 const SEEK_FADE_DURATION = 0.05;
+const IDX_SEEK_GEN = 4;
 
 type FFmpegPlayerEventMap = {
 	[K in keyof PlayerEventMap]: CustomEvent<PlayerEventMap[K]>;
@@ -20,16 +22,17 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	private worker: Worker | null = null;
 	private audioCtx: AudioContext | null = null;
 	private masterGain: GainNode | null = null;
+	public analyser: AnalyserNode | null = null;
 	private metadata: AudioMetadata | null = null;
 
 	private playerState: PlayerState = "idle";
 	private nextStartTime = 0;
-	private timeOffset = 0;
 	private isWorkerPaused = false;
 	private activeSources: AudioBufferSourceNode[] = [];
 	private isDecodingFinished = false;
 	private targetVolume = 1.0;
 	private currentTempo = 1.0;
+
 	/** 锚点时刻的 AudioContext 时间 */
 	private anchorWallTime = 0;
 	/** 锚点时刻的 音频资源 时间（00:00） */
@@ -46,7 +49,12 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	private timeUpdateFrameId: number = 0;
 	private currentMessageId = 0;
 
-	public analyser: AnalyserNode | null = null;
+	private ringBuffer: SharedRingBuffer | null = null;
+	private sabHeader: Int32Array | null = null;
+	private fetchController: AbortController | null = null;
+	private isStreaming = false;
+	private currentUrl: string | null = null;
+	private fileSize = 0;
 
 	private pendingExports = new Map<
 		number,
@@ -57,61 +65,17 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		super();
 	}
 
-	public override dispatch<K extends keyof FFmpegPlayerEventMap>(
-		type: K,
-		...args: GetDetail<FFmpegPlayerEventMap[K]> extends undefined
-			? [detail?: GetDetail<FFmpegPlayerEventMap[K]>]
-			: [detail: GetDetail<FFmpegPlayerEventMap[K]>]
-	): boolean {
-		switch (type) {
-			case "loadstart":
-				this.playerState = "loading";
-				break;
-			case "canplay":
-			case "loadedmetadata":
-				if (this.playerState !== "playing" && this.playerState !== "error") {
-					this.playerState = "ready";
-				}
-				break;
-			case "playing":
-				this.playerState = "playing";
-				break;
-			case "pause":
-				this.playerState = "paused";
-				break;
-			case "ended":
-				this.playerState = "idle";
-				break;
-			case "error":
-				this.playerState = "error";
-				break;
-			case "emptied":
-				this.playerState = "idle";
-				break;
-		}
-
-		return super.dispatch(type, ...args);
-	}
-
 	public get state() {
 		return this.playerState;
 	}
 	public get duration() {
 		return this.metadata?.duration || 0;
 	}
-	/**
-	 * 获取当前的播放进度，单位为秒
-	 */
 	public get currentTime() {
 		if (!this.audioCtx) return 0;
-
-		// 计算从上一个锚点到现在，现实世界过了多久
 		const wallDelta = this.audioCtx.currentTime - this.anchorWallTime;
-
-		// 乘以倍速，得出音频实际走了多久
 		const currentPosition =
 			this.anchorSourceTime + wallDelta * this.currentTempo;
-
 		return Math.max(0, currentPosition);
 	}
 	public get volume() {
@@ -121,37 +85,19 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		return this.metadata;
 	}
 
-	private postToWorker(msg: WorkerRequest) {
-		this.worker?.postMessage(msg);
-	}
-
 	public async load(file: File) {
 		this.reset();
 		this.dispatch("loadstart");
 
 		try {
-			if (!this.audioCtx) {
-				const AudioContext = window.AudioContext;
-				this.audioCtx = new AudioContext();
-
-				this.masterGain = this.audioCtx.createGain();
-				this.masterGain.gain.value = 0;
-
-				this.analyser = this.audioCtx.createAnalyser();
-				this.analyser.fftSize = 2048;
-
-				this.analyser.connect(this.masterGain);
-				this.masterGain.connect(this.audioCtx.destination);
-			}
-
-			if (this.audioCtx.state === "running") {
-				await this.audioCtx.suspend();
-			}
+			await this.initAudioContext();
 
 			this.worker = this.workerFactory();
 			this.setupWorkerListeners();
 
 			this.currentMessageId = Date.now();
+			this.isStreaming = false;
+
 			this.postToWorker({
 				type: "INIT",
 				id: this.currentMessageId,
@@ -160,6 +106,118 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 			});
 		} catch (e) {
 			this.dispatch("error", (e as Error).message);
+		}
+	}
+
+	public async loadSrc(url: string) {
+		this.reset();
+		this.dispatch("loadstart");
+
+		try {
+			await this.initAudioContext();
+
+			const response = await fetch(url, { method: "HEAD" });
+			if (!response.ok) {
+				throw new Error(`Failed to fetch metadata: ${response.statusText}`);
+			}
+			const contentLength = response.headers.get("Content-Length");
+			if (!contentLength) {
+				throw new Error("Content-Length header is missing");
+			}
+
+			this.fileSize = parseInt(contentLength, 10);
+			this.currentUrl = url;
+
+			const BUFFER_SIZE = 2 * 1024 * 1024;
+			this.ringBuffer = SharedRingBuffer.create(BUFFER_SIZE);
+
+			const sab = this.ringBuffer.sharedArrayBuffer;
+			this.sabHeader = new Int32Array(sab, 0, IDX_SEEK_GEN + 1);
+
+			this.worker = this.workerFactory();
+			this.setupWorkerListeners();
+
+			this.currentMessageId = Date.now();
+			this.isStreaming = true;
+
+			this.postToWorker({
+				type: "INIT_STREAM",
+				id: this.currentMessageId,
+				fileSize: this.fileSize,
+				sab: sab,
+				chunkSize: 4096 * 8,
+			});
+
+			this.runFetchLoop(url, 0, this.fileSize);
+		} catch (e) {
+			this.dispatch("error", (e as Error).message);
+		}
+	}
+
+	private async runFetchLoop(
+		url: string,
+		startOffset: number,
+		totalSize: number,
+	) {
+		if (this.fetchController) {
+			this.fetchController.abort();
+		}
+		this.fetchController = new AbortController();
+		const signal = this.fetchController.signal;
+
+		if (startOffset >= totalSize) {
+			this.ringBuffer?.setEOF();
+			this.notifyWorkerSeek();
+			return;
+		}
+
+		try {
+			const safeStartOffset = Math.floor(startOffset);
+			const response = await fetch(url, {
+				headers: {
+					Range: `bytes=${safeStartOffset}-`,
+				},
+				signal,
+			});
+
+			if (response.status === 416) {
+				this.ringBuffer?.setEOF();
+				this.notifyWorkerSeek();
+				return;
+			}
+
+			if (!response.ok && response.status !== 206) {
+				throw new Error(
+					`Fetch failed: ${response.status} ${response.statusText}`,
+				);
+			}
+
+			if (!response.body) throw new Error("Response body is null");
+
+			const reader = response.body.getReader();
+
+			this.notifyWorkerSeek();
+
+			while (true) {
+				const { done, value } = await reader.read();
+
+				if (done) {
+					this.ringBuffer?.setEOF();
+					break;
+				}
+
+				if (value && this.ringBuffer) {
+					await this.ringBuffer.write(value);
+				}
+
+				if (signal.aborted) break;
+			}
+		} catch (err: unknown) {
+			if ((err as Error).name === "AbortError") {
+				// ignore
+			} else {
+				this.dispatch("error", `Network error: ${(err as Error).message}`);
+			}
 		}
 	}
 
@@ -173,7 +231,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		}
 
 		if (this.worker && this.isWorkerPaused) {
-			this.worker.postMessage({ type: "RESUME", id: this.currentMessageId });
+			this.postToWorker({ type: "RESUME", id: this.currentMessageId });
 			this.isWorkerPaused = false;
 		}
 
@@ -264,49 +322,35 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	}
 
 	public async setTempo(tempo: number) {
-		if (!this.worker || !this.audioCtx) return;
-
+		if (!this.worker) return;
 		const trueTime = this.currentTime;
-		this.worker.postMessage({ type: "SET_TEMPO", value: tempo });
+		this.postToWorker({ type: "SET_TEMPO", value: tempo });
 		this.currentTempo = tempo;
 		await this.seek(trueTime, true);
 	}
 
 	public async setPitch(pitch: number) {
-		if (!this.worker || !this.audioCtx) return;
-
+		if (!this.worker) return;
 		const trueTime = this.currentTime;
-		this.worker.postMessage({ type: "SET_PITCH", value: pitch });
+		this.postToWorker({ type: "SET_PITCH", value: pitch });
 		await this.seek(trueTime, true);
 	}
 
-	/**
-	 * 原子操作：同时重置倍速和音调，只执行一次 Seek
-	 */
 	public async resetTempoAndPitch() {
-		if (!this.worker || !this.audioCtx) return;
-
+		if (!this.worker) return;
 		const trueTime = this.currentTime;
-
 		this.currentTempo = 1.0;
-
-		this.worker.postMessage({ type: "SET_TEMPO", value: 1.0 });
-		this.worker.postMessage({ type: "SET_PITCH", value: 1.0 });
-
+		this.postToWorker({ type: "SET_TEMPO", value: 1.0 });
+		this.postToWorker({ type: "SET_PITCH", value: 1.0 });
 		await this.seek(trueTime, true);
 	}
 
-	public async exportAsWav(file: File) {
-		if (!this.worker) {
-			throw new Error("Worker not initialized");
-		}
-
+	public async exportAsWav(file: File): Promise<Blob> {
+		if (!this.worker) throw new Error("Worker not initialized");
 		const exportId = Date.now();
-
 		return new Promise<Blob>((resolve, reject) => {
 			this.pendingExports.set(exportId, { resolve, reject });
-
-			this.worker?.postMessage({
+			this.postToWorker({
 				type: "EXPORT_WAV",
 				id: exportId,
 				file: file,
@@ -314,67 +358,25 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		});
 	}
 
-	private stopActiveSources() {
-		this.activeSources.forEach((source) => {
-			try {
-				source.stop();
-			} catch {
-				// 忽略已停止的错误
-			}
-		});
-		this.activeSources = [];
-	}
+	private async initAudioContext() {
+		if (!this.audioCtx) {
+			const AudioContextCtor =
+				// biome-ignore lint/suspicious/noExplicitAny: 兼容
+				window.AudioContext || (window as any).webkitAudioContext;
+			this.audioCtx = new AudioContextCtor();
 
-	public destroy() {
-		this.reset();
-
-		if (this.worker) {
-			this.worker.terminate();
-			this.worker = null;
-		}
-
-		if (this.audioCtx) {
-			this.audioCtx.close();
-			this.audioCtx = null;
-			this.masterGain = null;
-		}
-	}
-
-	private reset() {
-		this.stopTimeUpdate();
-
-		this.audioCtx?.suspend();
-
-		this.stopActiveSources();
-		this.activeSources = [];
-
-		this.metadata = null;
-		this.isWorkerPaused = false;
-		this.isDecodingFinished = false;
-		this.timeOffset = this.audioCtx ? this.audioCtx.currentTime : 0;
-		this.nextStartTime = this.timeOffset;
-
-		if (this.masterGain) {
-			this.masterGain.gain.cancelScheduledValues(0);
+			this.masterGain = this.audioCtx.createGain();
 			this.masterGain.gain.value = 0;
+
+			this.analyser = this.audioCtx.createAnalyser();
+			this.analyser.fftSize = 2048;
+
+			this.analyser.connect(this.masterGain);
+			this.masterGain.connect(this.audioCtx.destination);
 		}
-
-		this.dispatch("emptied");
-	}
-
-	private syncTimeAnchor(wallTime: number, sourceTime: number) {
-		this.anchorWallTime = wallTime;
-		this.anchorSourceTime = sourceTime;
-	}
-
-	private rampGain(target: number, duration: number) {
-		if (!this.masterGain || !this.audioCtx) return;
-
-		const now = this.audioCtx.currentTime;
-
-		this.masterGain.gain.cancelScheduledValues(now);
-		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
-		this.masterGain.gain.linearRampToValueAtTime(target, now + duration);
+		if (this.audioCtx.state === "running") {
+			await this.audioCtx.suspend();
+		}
 	}
 
 	private setupWorkerListeners() {
@@ -382,18 +384,33 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 
 		this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
 			const resp = event.data;
-			const pendingExport = this.pendingExports.get(resp.id);
 
-			if (pendingExport) {
-				if (resp.type === "EXPORT_WAV_DONE") {
-					pendingExport.resolve(resp.blob);
+			if (resp.type === "EXPORT_WAV_DONE") {
+				const pending = this.pendingExports.get(resp.id);
+				if (pending) {
+					pending.resolve(resp.blob);
 					this.pendingExports.delete(resp.id);
-					return;
-				} else if (resp.type === "ERROR") {
-					pendingExport.reject(new Error(resp.error));
-					this.pendingExports.delete(resp.id);
-					return;
 				}
+				return;
+			}
+			if (resp.type === "ERROR" && this.pendingExports.has(resp.id)) {
+				const pending = this.pendingExports.get(resp.id);
+				if (pending) {
+					pending.reject(new Error(resp.error));
+					this.pendingExports.delete(resp.id);
+				}
+				return;
+			}
+
+			if (resp.type === "SEEK_NET") {
+				if (this.isStreaming && this.ringBuffer && this.currentUrl) {
+					if (this.fetchController) {
+						this.fetchController.abort();
+					}
+					this.ringBuffer.reset();
+					this.runFetchLoop(this.currentUrl, resp.seekOffset, this.fileSize);
+				}
+				return;
 			}
 
 			if (resp.id !== this.currentMessageId) return;
@@ -480,6 +497,17 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		};
 	}
 
+	private notifyWorkerSeek() {
+		if (this.sabHeader) {
+			Atomics.add(this.sabHeader, IDX_SEEK_GEN, 1);
+			Atomics.notify(this.sabHeader, IDX_SEEK_GEN, 1);
+		}
+	}
+
+	private postToWorker(msg: WorkerRequest) {
+		this.worker?.postMessage(msg);
+	}
+
 	private scheduleChunk(
 		planarData: Float32Array,
 		sampleRate: number,
@@ -549,6 +577,30 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		this.dispatch("ended");
 	}
 
+	private syncTimeAnchor(wallTime: number, sourceTime: number) {
+		this.anchorWallTime = wallTime;
+		this.anchorSourceTime = sourceTime;
+	}
+
+	private rampGain(target: number, duration: number) {
+		if (!this.masterGain || !this.audioCtx) return;
+		const now = this.audioCtx.currentTime;
+		this.masterGain.gain.cancelScheduledValues(now);
+		this.masterGain.gain.setValueAtTime(this.masterGain.gain.value, now);
+		this.masterGain.gain.linearRampToValueAtTime(target, now + duration);
+	}
+
+	private stopActiveSources() {
+		this.activeSources.forEach((source) => {
+			try {
+				source.stop();
+			} catch {
+				// ignore
+			}
+		});
+		this.activeSources = [];
+	}
+
 	private startTimeUpdate() {
 		this.stopTimeUpdate();
 		const tick = () => {
@@ -564,6 +616,82 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		if (this.timeUpdateFrameId) {
 			cancelAnimationFrame(this.timeUpdateFrameId);
 			this.timeUpdateFrameId = 0;
+		}
+	}
+
+	public override dispatch<K extends keyof FFmpegPlayerEventMap>(
+		type: K,
+		...args: GetDetail<FFmpegPlayerEventMap[K]> extends undefined
+			? [detail?: GetDetail<FFmpegPlayerEventMap[K]>]
+			: [detail: GetDetail<FFmpegPlayerEventMap[K]>]
+	): boolean {
+		switch (type) {
+			case "loadstart":
+				this.playerState = "loading";
+				break;
+			case "canplay":
+			case "loadedmetadata":
+				if (this.playerState !== "playing" && this.playerState !== "error") {
+					this.playerState = "ready";
+				}
+				break;
+			case "playing":
+				this.playerState = "playing";
+				break;
+			case "pause":
+				this.playerState = "paused";
+				break;
+			case "ended":
+				this.playerState = "idle";
+				break;
+			case "error":
+				this.playerState = "error";
+				break;
+			case "emptied":
+				this.playerState = "idle";
+				break;
+		}
+		return super.dispatch(type, ...args);
+	}
+
+	private reset() {
+		this.stopTimeUpdate();
+		this.audioCtx?.suspend();
+		this.stopActiveSources();
+		this.activeSources = [];
+
+		this.metadata = null;
+		this.isWorkerPaused = false;
+		this.isDecodingFinished = false;
+		this.nextStartTime = this.audioCtx ? this.audioCtx.currentTime : 0;
+
+		if (this.masterGain) {
+			this.masterGain.gain.cancelScheduledValues(0);
+			this.masterGain.gain.value = 0;
+		}
+
+		if (this.fetchController) {
+			this.fetchController.abort();
+			this.fetchController = null;
+		}
+		this.isStreaming = false;
+		this.ringBuffer = null;
+		this.sabHeader = null;
+
+		this.dispatch("emptied");
+	}
+
+	public destroy() {
+		this.reset();
+		if (this.worker) {
+			this.worker.terminate();
+			this.worker = null;
+		}
+		if (this.audioCtx) {
+			this.audioCtx.close();
+			this.audioCtx = null;
+			this.masterGain = null;
+			this.analyser = null;
 		}
 	}
 }

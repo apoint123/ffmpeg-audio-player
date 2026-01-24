@@ -115,7 +115,6 @@ const confFlags = [
 	"--disable-encoders",
 	"--disable-muxers",
 	"--disable-avdevice",
-	"--disable-postproc",
 	"--disable-avfilter",
 	"--disable-swscale",
 

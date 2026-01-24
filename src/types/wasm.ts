@@ -50,6 +50,10 @@ export interface ChunkResult {
 
 export interface AudioStreamDecoder extends EmbindObject {
 	init(path: string): AudioProperties;
+	initStream(
+		readCallback: (ptr: number, size: number) => number,
+		seekCallback: (offset: number, whence: number) => number,
+	): AudioProperties;
 	readChunk(chunkSize: number, format?: SampleFormat): ChunkResult;
 	seek(timestamp: number): DecoderStatus;
 	close(): void;

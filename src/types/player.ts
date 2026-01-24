@@ -36,6 +36,13 @@ export interface PlayerEventMap {
 
 export type WorkerRequest =
 	| { type: "INIT"; id: number; file: File; chunkSize: number }
+	| {
+			type: "INIT_STREAM";
+			id: number;
+			fileSize: number;
+			sab: SharedArrayBuffer;
+			chunkSize: number;
+	  }
 	| { type: "PAUSE"; id: number }
 	| { type: "RESUME"; id: number }
 	| { type: "SEEK"; id: number; seekTime: number }
@@ -60,9 +67,9 @@ export type WorkerResponse =
 			type: "CHUNK";
 			id: number;
 			data: Float32Array;
-			time?: number;
 			startTime: number;
 	  }
 	| { type: "EOF"; id: number }
 	| { type: "SEEK_DONE"; id: number; time: number }
+	| { type: "SEEK_NET"; id: number; seekOffset: number }
 	| { type: "EXPORT_WAV_DONE"; id: number; blob: Blob };

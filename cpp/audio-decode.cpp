@@ -48,6 +48,22 @@ struct ChunkResult {
     double startTime;
 };
 
+struct StreamContext {
+    emscripten::val readFn;
+    emscripten::val seekFn;
+};
+
+static int read_packet_wrapper(void* opaque, uint8_t* buf, int buf_size) {
+    StreamContext* ctx = (StreamContext*)opaque;
+    int bytesRead = ctx->readFn(reinterpret_cast<uintptr_t>(buf), buf_size).as<int>();
+    return bytesRead == 0 ? AVERROR_EOF : bytesRead;
+}
+
+static int64_t seek_wrapper(void* opaque, int64_t offset, int whence) {
+    StreamContext* ctx = (StreamContext*)opaque;
+    return (int64_t)ctx->seekFn((double)offset, whence).as<double>();
+}
+
 std::string get_error_str(int status) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
     av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, status);
@@ -138,6 +154,10 @@ class AudioStreamDecoder {
     FramePtr frame;
     SwrCtxPtr swr_ctx;
 
+    AVIOContext* avio_ctx = nullptr;
+    uint8_t* avio_buffer = nullptr;
+    std::unique_ptr<StreamContext> stream_ctx;
+
     // SoundTouch 实例
     soundtouch::SoundTouch m_soundTouch;
 
@@ -164,29 +184,8 @@ class AudioStreamDecoder {
     // 当前流的时间基
     AVRational m_time_base = {1, 1};
 
-   public:
-    AudioStreamDecoder() {}
-
-    ~AudioStreamDecoder() = default;
-
-    void setTempo(double tempo) { m_soundTouch.setTempo(tempo); }
-
-    void setPitch(double pitch) { m_soundTouch.setPitch(pitch); }
-
-    AudioProperties init(std::string path) {
-        av_log_set_level(AV_LOG_ERROR);
-
-        close();
-
+    AudioProperties setupDecoder() {
         Status status = {0, ""};
-
-        AVFormatContext* raw_fmt_ctx = nullptr;
-        if ((status.status = avformat_open_input(&raw_fmt_ctx, path.c_str(), nullptr, nullptr)) !=
-            0) {
-            status.error = "avformat_open_input: " + get_error_str(status.status);
-            return {status};
-        }
-        format_ctx.reset(raw_fmt_ctx);
 
         if ((status.status = avformat_find_stream_info(format_ctx.get(), nullptr)) < 0) {
             status.error = "avformat_find_stream_info: " + get_error_str(status.status);
@@ -223,7 +222,6 @@ class AudioStreamDecoder {
         m_soundTouch.setRate(1.0);
 
         swr_ctx.reset(swr_alloc());
-
         av_opt_set_chlayout(swr_ctx.get(), "in_chlayout", &codec_ctx->ch_layout, 0);
         av_opt_set_int(swr_ctx.get(), "in_sample_rate", codec_ctx->sample_rate, 0);
         av_opt_set_sample_fmt(swr_ctx.get(), "in_sample_fmt", codec_ctx->sample_fmt, 0);
@@ -252,9 +250,9 @@ class AudioStreamDecoder {
             meta_map[std::string(tag->key)] = std::string(tag->value);
         }
 
-        tag = nullptr;
         if (audio_stream_index >= 0 && audio_stream_index < format_ctx->nb_streams) {
             AVDictionary* stream_meta = format_ctx->streams[audio_stream_index]->metadata;
+            tag = nullptr;
             while ((tag = av_dict_get(stream_meta, "", tag, AV_DICT_IGNORE_SUFFIX))) {
                 meta_map[std::string(tag->key)] = std::string(tag->value);
             }
@@ -290,6 +288,64 @@ class AudioStreamDecoder {
             cover_data,
             bits,
         };
+    }
+
+   public:
+    AudioStreamDecoder() {}
+    ~AudioStreamDecoder() { close(); }
+
+    void setTempo(double tempo) { m_soundTouch.setTempo(tempo); }
+
+    void setPitch(double pitch) { m_soundTouch.setPitch(pitch); }
+
+    AudioProperties init(std::string path) {
+        av_log_set_level(AV_LOG_ERROR);
+        close();
+
+        Status status = {0, ""};
+        AVFormatContext* raw_fmt_ctx = nullptr;
+
+        if ((status.status = avformat_open_input(&raw_fmt_ctx, path.c_str(), nullptr, nullptr)) !=
+            0) {
+            status.error = "avformat_open_input: " + get_error_str(status.status);
+            return {status};
+        }
+        format_ctx.reset(raw_fmt_ctx);
+
+        return setupDecoder();
+    }
+
+    AudioProperties initStream(emscripten::val readFn, emscripten::val seekFn) {
+        av_log_set_level(AV_LOG_ERROR);
+        close();
+
+        Status status = {0, ""};
+
+        stream_ctx = std::make_unique<StreamContext>(StreamContext{readFn, seekFn});
+
+        const int avio_buffer_size = 32768;
+        avio_buffer = (uint8_t*)av_malloc(avio_buffer_size);
+        if (!avio_buffer) return {{-1, "Failed to alloc avio buffer"}};
+
+        avio_ctx = avio_alloc_context(avio_buffer, avio_buffer_size, 0, stream_ctx.get(),
+                                      &read_packet_wrapper, nullptr, &seek_wrapper);
+        if (!avio_ctx) return {{-1, "Failed to alloc AVIOContext"}};
+
+        format_ctx.reset(avformat_alloc_context());
+        if (!format_ctx) return {{-1, "Failed to alloc AVFormatContext"}};
+
+        format_ctx->pb = avio_ctx;
+        format_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+        AVFormatContext* raw_fmt_ctx = format_ctx.release();
+        if ((status.status = avformat_open_input(&raw_fmt_ctx, nullptr, nullptr, nullptr)) != 0) {
+            status.error = "avformat_open_input: " + get_error_str(status.status);
+            format_ctx.reset(nullptr);
+            return {status};
+        }
+        format_ctx.reset(raw_fmt_ctx);
+
+        return setupDecoder();
     }
 
     ChunkResult readChunk(int chunkSize, SampleFormat format = SampleFormat::PlanarF32) {
@@ -488,6 +544,14 @@ class AudioStreamDecoder {
         if (!initialized) return {-1, "Not initialized"};
 
         Status status = {0, ""};
+
+        if (format_ctx->duration > 0) {
+            double file_duration = (double)format_ctx->duration / AV_TIME_BASE;
+            if (timestamp >= file_duration - 0.2) {
+                timestamp = std::max(0.0, file_duration - 0.2);
+            }
+        }
+
         AVStream* stream = format_ctx->streams[audio_stream_index];
 
         int64_t target_ts =
@@ -516,6 +580,15 @@ class AudioStreamDecoder {
         codec_ctx.reset();
         format_ctx.reset();
         resample_buffer.reset();
+
+        if (avio_ctx) {
+            av_freep(&avio_ctx->buffer);
+            avio_context_free(&avio_ctx);
+            avio_ctx = nullptr;
+            avio_buffer = nullptr;
+        }
+        stream_ctx.reset();
+
         initialized = false;
         m_next_pts = AV_NOPTS_VALUE;
 
@@ -558,6 +631,7 @@ EMSCRIPTEN_BINDINGS(my_module) {
     class_<AudioStreamDecoder>("AudioStreamDecoder")
         .constructor<>()
         .function("init", &AudioStreamDecoder::init)
+        .function("initStream", &AudioStreamDecoder::initStream)
         .function("readChunk", &AudioStreamDecoder::readChunk)
         .function("seek", &AudioStreamDecoder::seek)
         .function("close", &AudioStreamDecoder::close)

@@ -1,10 +1,14 @@
 import type {
 	AudioDecoderModule,
+	AudioProperties,
 	AudioStreamDecoder,
 	WorkerRequest,
 	WorkerResponse,
 } from "@/types";
+import { SharedRingBuffer } from "@/utils/SharedRingBuffer.js";
 import createAudioDecoderCore from "../assets/decode-audio.js";
+
+const IDX_SEEK_GEN = 4; // Header(16 bytes) + 4 bytes offset
 
 let ffmpegModulePromise: Promise<AudioDecoderModule> | null = null;
 
@@ -22,53 +26,112 @@ function getModule(): Promise<AudioDecoderModule> {
 
 class DecoderSession {
 	private decoder: AudioStreamDecoder | null = null;
-	private mountDir: string;
-	/**
-	 * 是否活着，用于退出循环
-	 */
+	private mountDir: string | null = null;
 	private isRunning = true;
-	/**
-	 * 是否暂停，用于暂时挂起
-	 */
 	private isPaused = false;
+
+	private ringBuffer: SharedRingBuffer | null = null;
+	private sabHeader: Int32Array | null = null;
 
 	constructor(
 		private module: AudioDecoderModule,
-		public req: WorkerRequest & { type: "INIT" },
+		public req: WorkerRequest & { type: "INIT" | "INIT_STREAM" },
 	) {
-		this.mountDir = `/session_${req.id}`;
-		this.init();
+		if (req.type === "INIT") {
+			this.mountDir = `/session_${req.id}`;
+			this.initFile(req.file);
+		} else {
+			this.initStream(req.sab, req.fileSize);
+		}
 	}
 
-	private init() {
+	private initFile(file: File) {
+		if (!this.mountDir) return;
 		try {
 			this.module.FS.mkdir(this.mountDir);
 			this.module.FS.mount(
 				this.module.FS.filesystems.WORKERFS,
-				{ files: [this.req.file] },
+				{ files: [file] },
 				this.mountDir,
 			);
 		} catch (e) {
 			console.warn(`[DecoderSession] Mount error: ${e}`);
 		}
 
-		const filePath = `${this.mountDir}/${this.req.file.name}`;
+		const filePath = `${this.mountDir}/${file.name}`;
 		this.decoder = new this.module.AudioStreamDecoder();
 		const props = this.decoder.init(filePath);
 
+		this.handleInitResult(props);
+		this.decodeLoop();
+	}
+
+	private initStream(sab: SharedArrayBuffer, fileSize: number) {
+		this.ringBuffer = new SharedRingBuffer(sab);
+		this.sabHeader = new Int32Array(sab, 0, IDX_SEEK_GEN + 1);
+
+		this.decoder = new this.module.AudioStreamDecoder();
+
+		const readCallback = (ptr: number, size: number): number => {
+			if (!this.ringBuffer) return -1;
+			return this.ringBuffer.blockingRead(this.module.HEAPU8, ptr, size);
+		};
+
+		const seekCallback = (offset: number, whence: number): number => {
+			// AVSEEK_SIZE
+			if (whence === 65536) {
+				return fileSize;
+			}
+
+			if (!this.sabHeader) return -1;
+
+			let targetPos = offset;
+			if (whence === 2) {
+				// SEEK_END
+				targetPos = fileSize + offset;
+			}
+
+			// 防止 FFmpeg 估算的 offset 超过文件实际大小导致 HTTP 416 或立即 EOF
+			if (targetPos >= fileSize) {
+				// 回退到文件末尾前 128KB，确保有数据可读，让 FFmpeg 能找到帧头 resync
+				const SAFE_MARGIN = 128 * 1024;
+				const newPos = Math.max(0, fileSize - SAFE_MARGIN);
+				// console.warn(
+				// 	`[Worker] Seek target ${targetPos} > fileSize ${fileSize}. Smart clamping to ${newPos}`,
+				// );
+				targetPos = newPos;
+			}
+
+			const currentGen = Atomics.load(this.sabHeader, IDX_SEEK_GEN);
+
+			this.post({
+				type: "SEEK_NET",
+				id: this.req.id,
+				seekOffset: targetPos,
+			});
+
+			Atomics.wait(this.sabHeader, IDX_SEEK_GEN, currentGen);
+
+			return targetPos;
+		};
+
+		const props = this.decoder.initStream(readCallback, seekCallback);
+		this.handleInitResult(props);
+		this.decodeLoop();
+	}
+
+	private handleInitResult(props: AudioProperties) {
 		if (props.status.status < 0) {
 			throw new Error(`Decoder init failed: ${props.status.error}`);
 		}
 
 		const metadataObj: Record<string, string> = {};
-
 		const keysList = props.metadata.keys();
 
 		for (let i = 0; i < keysList.size(); i++) {
 			const key = keysList.get(i);
 			metadataObj[key] = props.metadata.get(key);
 		}
-
 		keysList.delete();
 
 		let coverUrl: string | undefined;
@@ -92,34 +155,35 @@ class DecoderSession {
 			bitsPerSample: props.bitsPerSample,
 		});
 
-		props.metadata?.delete();
-		props.coverArt?.delete();
-
-		this.decodeLoop();
+		props.metadata.delete();
+		props.coverArt.delete();
 	}
 
 	private decodeLoop = () => {
-		if (!this.isRunning) return;
-		if (this.isPaused || !this.decoder) return;
+		if (!this.isRunning || this.isPaused || !this.decoder) return;
 
 		try {
 			const FORMAT_F32 = this.module.SampleFormat.PlanarF32;
 			const result = this.decoder.readChunk(this.req.chunkSize, FORMAT_F32);
 
 			if (result.status.status < 0) {
-				throw new Error(`Decode error: ${result.status.error}`);
+				// EOF
+				if (result.status.status !== -541478725) {
+					throw new Error(`Decode error: ${result.status.error}`);
+				}
 			}
 
 			if (result.samples.length > 0) {
-				const chunkData = result.samples.slice() as Float32Array;
+				const chunkData = result.samples as Float32Array;
+				const copy = chunkData.slice();
 				this.post(
 					{
 						type: "CHUNK",
 						id: this.req.id,
-						data: chunkData,
+						data: copy,
 						startTime: result.startTime,
 					},
-					[chunkData.buffer],
+					[copy.buffer],
 				);
 			}
 
@@ -160,12 +224,7 @@ class DecoderSession {
 			this.isPaused = false;
 			this.decodeLoop();
 		} catch (e) {
-			this.post({
-				type: "ERROR",
-				id: newId,
-				error: e instanceof Error ? e.message : String(e),
-			});
-			this.destroy();
+			this.handleError(e);
 		}
 	}
 
@@ -191,9 +250,12 @@ class DecoderSession {
 				this.module.FS.unmount(this.mountDir);
 				this.module.FS.rmdir(this.mountDir);
 			} catch {
-				// 忽略卸载错误
+				// ignore
 			}
 		}
+
+		this.ringBuffer = null;
+		this.sabHeader = null;
 	}
 
 	private handleError(e: unknown) {
@@ -210,8 +272,10 @@ class DecoderSession {
 	}
 }
 
-async function handleExportWav(req: WorkerRequest & { type: "EXPORT_WAV" }) {
-	const module = await getModule();
+async function handleExportWav(
+	module: AudioDecoderModule,
+	req: WorkerRequest & { type: "EXPORT_WAV" },
+) {
 	const mountDir = `/export_${req.id}`;
 	let decoder: AudioStreamDecoder | null = null;
 
@@ -247,7 +311,7 @@ async function handleExportWav(req: WorkerRequest & { type: "EXPORT_WAV" }) {
 			}
 
 			if (result.samples.length > 0) {
-				chunks.push(result.samples.slice() as Int16Array);
+				chunks.push(result.samples as Int16Array);
 			}
 
 			if (result.isEOF) break;
@@ -261,6 +325,9 @@ async function handleExportWav(req: WorkerRequest & { type: "EXPORT_WAV" }) {
 			props.channelCount,
 			dataByteLength,
 		);
+
+		props.metadata.delete();
+		props.coverArt.delete();
 
 		const blob = new Blob([wavHeader, ...chunks] as BlobPart[], {
 			type: "audio/wav",
@@ -332,6 +399,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 
 	switch (req.type) {
 		case "INIT":
+		case "INIT_STREAM":
 			currentSession?.destroy();
 			currentSession = null;
 
@@ -363,17 +431,16 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 			}
 			break;
 		case "SET_TEMPO":
-			if (currentSession) {
-				currentSession.setTempo(req.value);
-			}
+			currentSession?.setTempo(req.value);
 			break;
 		case "SET_PITCH":
-			if (currentSession) {
-				currentSession.setPitch(req.value);
-			}
+			currentSession?.setPitch(req.value);
 			break;
 		case "EXPORT_WAV":
-			handleExportWav(req);
+			{
+				const module = await getModule();
+				handleExportWav(module, req);
+			}
 			break;
 	}
 };

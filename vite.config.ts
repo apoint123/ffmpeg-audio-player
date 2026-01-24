@@ -8,6 +8,12 @@ export default defineConfig({
 			tsconfigPath: "./tsconfig.json",
 		}),
 	],
+	server: {
+		headers: {
+			"Cross-Origin-Opener-Policy": "same-origin",
+			"Cross-Origin-Embedder-Policy": "require-corp",
+		},
+	},
 	build: {
 		lib: {
 			entry: resolve(__dirname, "src/index.ts"),

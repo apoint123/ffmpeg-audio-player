@@ -46,6 +46,8 @@ export const AudioPlayerDemo: React.FC = () => {
 	const [currentFile, setCurrentFile] = useState<File | null>(null);
 	const [isExporting, setIsExporting] = useState(false);
 
+	const [streamUrl, setStreamUrl] = useState("");
+
 	useEffect(() => {
 		return () => {
 			if (coverUrl) {
@@ -189,19 +191,31 @@ export const AudioPlayerDemo: React.FC = () => {
 		};
 	}, []);
 
+	const resetUIState = () => {
+		setErrorMsg(null);
+		setCurrentTime(0);
+		setDuration(0);
+		setMetadata({});
+		setCoverUrl(null);
+		setFormatInfo(null);
+		setTempo(1.0);
+		setPitch(1.0);
+	};
+
 	const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
 		const file = e.target.files?.[0];
 		if (file && playerRef.current) {
 			setCurrentFile(file);
-			setErrorMsg(null);
-			setCurrentTime(0);
-			setDuration(0);
-			setMetadata({});
-			setCoverUrl(null);
-			setFormatInfo(null);
-			setTempo(1.0);
-			setPitch(1.0);
+			resetUIState();
 			playerRef.current.load(file);
+		}
+	};
+
+	const handleLoadUrl = () => {
+		if (streamUrl && playerRef.current) {
+			setCurrentFile(null);
+			resetUIState();
+			playerRef.current.loadSrc(streamUrl);
 		}
 	};
 
@@ -327,13 +341,60 @@ export const AudioPlayerDemo: React.FC = () => {
 		>
 			<h2>FFmpeg Audio Decoder Demo</h2>
 
-			<div style={{ marginBottom: "20px" }}>
-				<input
-					type="file"
-					accept="audio/*"
-					onChange={handleFileChange}
-					disabled={isLoading}
-				/>
+			<div
+				style={{
+					marginBottom: "20px",
+					display: "flex",
+					flexDirection: "column",
+					gap: "10px",
+				}}
+			>
+				<div
+					style={{
+						padding: "15px",
+						border: "1px solid #eee",
+						borderRadius: "8px",
+					}}
+				>
+					<strong>Local File: </strong>
+					<input
+						type="file"
+						accept="audio/*"
+						onChange={handleFileChange}
+						disabled={isLoading}
+					/>
+				</div>
+
+				<div
+					style={{
+						padding: "15px",
+						border: "1px solid #eee",
+						borderRadius: "8px",
+						display: "flex",
+						gap: "10px",
+						alignItems: "center",
+					}}
+				>
+					<strong>Stream URL: </strong>
+					<input
+						type="text"
+						value={streamUrl}
+						onChange={(e) => setStreamUrl(e.target.value)}
+						style={{ flex: 1, padding: "5px" }}
+						disabled={isLoading}
+					/>
+					<button
+						type="button"
+						onClick={handleLoadUrl}
+						disabled={isLoading || !streamUrl}
+						style={{ padding: "5px 15px", cursor: "pointer" }}
+					>
+						Load URL
+					</button>
+				</div>
+				<div style={{ fontSize: "12px", color: "#666" }}>
+					Note: Streaming requires server CORS support (Range header).
+				</div>
 			</div>
 
 			<div style={{ marginBottom: "10px" }}>
@@ -512,6 +573,7 @@ export const AudioPlayerDemo: React.FC = () => {
 					display: "flex",
 					justifyContent: "space-between",
 					alignItems: "center",
+					opacity: currentFile ? 1 : 0.5,
 				}}
 			>
 				<div>
@@ -519,7 +581,9 @@ export const AudioPlayerDemo: React.FC = () => {
 						Format Conversion
 					</strong>
 					<div style={{ fontSize: "12px", color: "#555", marginTop: "4px" }}>
-						Convert current file to WAV (Interleaved Int16)
+						{currentFile
+							? "Convert local file to WAV"
+							: "Not available for streams"}
 					</div>
 				</div>
 
