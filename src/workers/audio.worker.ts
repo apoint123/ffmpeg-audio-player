@@ -5,6 +5,7 @@ import type {
 	WorkerRequest,
 	WorkerResponse,
 } from "@/types";
+import { toError } from "@/utils/errorUtils.js";
 import { SharedRingBuffer } from "@/utils/SharedRingBuffer.js";
 import createAudioDecoderCore from "../assets/decode-audio.js";
 
@@ -259,10 +260,12 @@ class DecoderSession {
 	}
 
 	private handleError(e: unknown) {
+		const err = toError(e);
+		console.error("[Worker] DecoderSession error:", err);
 		this.post({
 			type: "ERROR",
 			id: this.req.id,
-			error: e instanceof Error ? e.message : String(e),
+			error: err.message,
 		});
 		this.destroy();
 	}
@@ -339,10 +342,12 @@ async function handleExportWav(
 			blob: blob,
 		});
 	} catch (e) {
+		const err = toError(e);
+		console.error("[Worker] Export WAV error:", err);
 		self.postMessage({
 			type: "ERROR",
 			id: req.id,
-			error: (e as Error).message,
+			error: err.message,
 		});
 	} finally {
 		if (decoder) {
@@ -406,36 +411,52 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
 			try {
 				const module = await getModule();
 				currentSession = new DecoderSession(module, req);
-			} catch (err) {
+				self.postMessage({ type: "ACK", id: req.id });
+			} catch (e) {
+				const err = toError(e);
+				console.error("[Worker] Init error:", err);
 				self.postMessage({
 					type: "ERROR",
 					id: req.id,
-					error: `Module load failed: ${(err as Error).message}`,
+					error: `Module load failed: ${err.message}`,
 				});
-				console.error(err);
 			}
 			break;
+
 		case "PAUSE":
-			if (currentSession && currentSession.req.id === req.id) {
+			if (currentSession) {
 				currentSession.pause();
+				self.postMessage({ type: "ACK", id: req.id });
 			}
 			break;
+
 		case "RESUME":
-			if (currentSession && currentSession.req.id === req.id) {
+			if (currentSession) {
 				currentSession.resume();
+				self.postMessage({ type: "ACK", id: req.id });
 			}
 			break;
+
 		case "SEEK":
 			if (currentSession) {
 				currentSession.seek(req.seekTime, req.id);
 			}
 			break;
+
 		case "SET_TEMPO":
-			currentSession?.setTempo(req.value);
+			if (currentSession) {
+				currentSession.setTempo(req.value);
+				self.postMessage({ type: "ACK", id: req.id });
+			}
 			break;
+
 		case "SET_PITCH":
-			currentSession?.setPitch(req.value);
+			if (currentSession) {
+				currentSession.setPitch(req.value);
+				self.postMessage({ type: "ACK", id: req.id });
+			}
 			break;
+
 		case "EXPORT_WAV":
 			{
 				const module = await getModule();

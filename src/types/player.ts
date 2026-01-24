@@ -46,12 +46,13 @@ export type WorkerRequest =
 	| { type: "PAUSE"; id: number }
 	| { type: "RESUME"; id: number }
 	| { type: "SEEK"; id: number; seekTime: number }
-	| { type: "SET_TEMPO"; value: number }
-	| { type: "SET_PITCH"; value: number }
+	| { type: "SET_TEMPO"; id: number; value: number }
+	| { type: "SET_PITCH"; id: number; value: number }
 	| { type: "EXPORT_WAV"; id: number; file: File };
 
 export type WorkerResponse =
 	| { type: "ERROR"; id: number; error: string }
+	| { type: "ACK"; id: number }
 	| {
 			type: "METADATA";
 			id: number;

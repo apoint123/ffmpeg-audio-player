@@ -5,8 +5,13 @@ import type {
 	WorkerRequest,
 	WorkerResponse,
 } from "./types";
+import { toError } from "./utils/errorUtils";
 import { SharedRingBuffer } from "./utils/SharedRingBuffer";
 import { type GetDetail, TypedEventTarget } from "./utils/TypedEventTarget";
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+	? Omit<T, K>
+	: never;
 
 const HIGH_WATER_MARK = 30;
 const LOW_WATER_MARK = 10;
@@ -38,16 +43,10 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	/** 锚点时刻的 音频资源 时间（00:00） */
 	private anchorSourceTime = 0;
 
-	/** 用于存储 seek 操作的 resolve 函数 */
-	private pendingSeekResolve:
-		| ((value: void | PromiseLike<void>) => void)
-		| null = null;
-
 	/** 标记当前 seek 是否不需要淡入淡出，用于 setTempo/setPitch */
 	private isImmediateSeek = false;
 
 	private timeUpdateFrameId: number = 0;
-	private currentMessageId = 0;
 
 	private ringBuffer: SharedRingBuffer | null = null;
 	private sabHeader: Int32Array | null = null;
@@ -56,9 +55,15 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	private currentUrl: string | null = null;
 	private fileSize = 0;
 
-	private pendingExports = new Map<
+	private msgIdCounter = 0;
+
+	private pendingRequests = new Map<
 		number,
-		{ resolve: (blob: Blob) => void; reject: (err: Error) => void }
+		{
+			resolve: (value?: unknown) => void;
+			reject: (reason?: Error) => void;
+			timer: number;
+		}
 	>();
 
 	constructor(private workerFactory: () => Worker) {
@@ -85,6 +90,40 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		return this.metadata;
 	}
 
+	private requestWorker<T = void>(
+		msg: DistributiveOmit<WorkerRequest, "id">,
+		transfer: Transferable[] = [],
+		timeoutMs = 5000,
+	): Promise<T> {
+		if (!this.worker) {
+			return Promise.reject(new Error("Worker not initialized"));
+		}
+
+		const id = ++this.msgIdCounter;
+		const requestPayload = { ...msg, id } as WorkerRequest;
+
+		return new Promise<T>((resolve, reject) => {
+			const timer = self.setTimeout(() => {
+				if (this.pendingRequests.has(id)) {
+					this.pendingRequests.delete(id);
+					reject(
+						new Error(
+							`Worker request timed out (type: ${msg.type}, id: ${id})`,
+						),
+					);
+				}
+			}, timeoutMs);
+
+			this.pendingRequests.set(id, {
+				resolve: resolve as (value?: unknown) => void,
+				reject: reject as (reason?: Error) => void,
+				timer,
+			});
+
+			this.worker?.postMessage(requestPayload, transfer);
+		});
+	}
+
 	public async load(file: File) {
 		this.reset();
 		this.dispatch("loadstart");
@@ -95,17 +134,17 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 			this.worker = this.workerFactory();
 			this.setupWorkerListeners();
 
-			this.currentMessageId = Date.now();
 			this.isStreaming = false;
 
-			this.postToWorker({
+			await this.requestWorker({
 				type: "INIT",
-				id: this.currentMessageId,
 				file,
 				chunkSize: 4096 * 8,
 			});
 		} catch (e) {
-			this.dispatch("error", (e as Error).message);
+			const err = toError(e);
+			console.error("[Player] Load error:", err);
+			this.dispatch("error", err.message);
 		}
 	}
 
@@ -136,21 +175,21 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 
 			this.worker = this.workerFactory();
 			this.setupWorkerListeners();
-
-			this.currentMessageId = Date.now();
 			this.isStreaming = true;
 
-			this.postToWorker({
+			const initWorkerPromise = this.requestWorker({
 				type: "INIT_STREAM",
-				id: this.currentMessageId,
 				fileSize: this.fileSize,
 				sab: sab,
 				chunkSize: 4096 * 8,
 			});
 
 			this.runFetchLoop(url, 0, this.fileSize);
+			await initWorkerPromise;
 		} catch (e) {
-			this.dispatch("error", (e as Error).message);
+			const err = toError(e);
+			console.error("[Player] LoadSrc error:", err);
+			this.dispatch("error", err.message);
 		}
 	}
 
@@ -212,11 +251,13 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 
 				if (signal.aborted) break;
 			}
-		} catch (err: unknown) {
-			if ((err as Error).name === "AbortError") {
-				// ignore
+		} catch (e) {
+			const err = toError(e);
+			if (err.name === "AbortError") {
+				return;
 			} else {
-				this.dispatch("error", `Network error: ${(err as Error).message}`);
+				console.error("[Player] Stream error:", err);
+				this.dispatch("error", `Network error: ${err.message}`);
 			}
 		}
 	}
@@ -231,7 +272,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		}
 
 		if (this.worker && this.isWorkerPaused) {
-			this.postToWorker({ type: "RESUME", id: this.currentMessageId });
+			await this.requestWorker({ type: "RESUME" });
 			this.isWorkerPaused = false;
 		}
 
@@ -248,7 +289,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		this.stopTimeUpdate();
 
 		if (this.worker) {
-			this.postToWorker({ type: "PAUSE", id: this.currentMessageId });
+			await this.requestWorker({ type: "PAUSE" });
 			this.isWorkerPaused = true;
 		}
 
@@ -271,11 +312,6 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		if (!this.worker || !this.audioCtx || !this.metadata || !this.masterGain)
 			return;
 
-		if (this.pendingSeekResolve) {
-			this.pendingSeekResolve();
-			this.pendingSeekResolve = null;
-		}
-
 		this.dispatch("seeking");
 		this.isImmediateSeek = immediate;
 
@@ -291,22 +327,13 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 
 		this.stopActiveSources();
 		this.activeSources = [];
-		this.currentMessageId = Date.now();
-
-		const seekPromise = new Promise<void>((resolve) => {
-			this.pendingSeekResolve = resolve;
-		});
-
-		this.postToWorker({
-			type: "SEEK",
-			id: this.currentMessageId,
-			seekTime: time,
-		});
 
 		this.isDecodingFinished = false;
 
-		// 等待 Worker 处理完成 (SEEK_DONE事件)
-		await seekPromise;
+		await this.requestWorker({
+			type: "SEEK",
+			seekTime: time,
+		});
 
 		this.dispatch("timeupdate", time);
 	}
@@ -324,7 +351,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	public async setTempo(tempo: number) {
 		if (!this.worker) return;
 		const trueTime = this.currentTime;
-		this.postToWorker({ type: "SET_TEMPO", value: tempo });
+		await this.requestWorker({ type: "SET_TEMPO", value: tempo });
 		this.currentTempo = tempo;
 		await this.seek(trueTime, true);
 	}
@@ -332,7 +359,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 	public async setPitch(pitch: number) {
 		if (!this.worker) return;
 		const trueTime = this.currentTime;
-		this.postToWorker({ type: "SET_PITCH", value: pitch });
+		await this.requestWorker({ type: "SET_PITCH", value: pitch });
 		await this.seek(trueTime, true);
 	}
 
@@ -340,21 +367,17 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		if (!this.worker) return;
 		const trueTime = this.currentTime;
 		this.currentTempo = 1.0;
-		this.postToWorker({ type: "SET_TEMPO", value: 1.0 });
-		this.postToWorker({ type: "SET_PITCH", value: 1.0 });
+		await Promise.all([
+			this.requestWorker({ type: "SET_TEMPO", value: 1.0 }),
+			this.requestWorker({ type: "SET_PITCH", value: 1.0 }),
+		]);
 		await this.seek(trueTime, true);
 	}
 
 	public async exportAsWav(file: File): Promise<Blob> {
-		if (!this.worker) throw new Error("Worker not initialized");
-		const exportId = Date.now();
-		return new Promise<Blob>((resolve, reject) => {
-			this.pendingExports.set(exportId, { resolve, reject });
-			this.postToWorker({
-				type: "EXPORT_WAV",
-				id: exportId,
-				file: file,
-			});
+		return this.requestWorker<Blob>({
+			type: "EXPORT_WAV",
+			file: file,
 		});
 	}
 
@@ -384,22 +407,37 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 
 		this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
 			const resp = event.data;
+			const msgId = resp.id;
 
-			if (resp.type === "EXPORT_WAV_DONE") {
-				const pending = this.pendingExports.get(resp.id);
-				if (pending) {
-					pending.resolve(resp.blob);
-					this.pendingExports.delete(resp.id);
+			if (this.pendingRequests.has(msgId)) {
+				// biome-ignore lint/style/noNonNullAssertion: 肯定有
+				const req = this.pendingRequests.get(msgId)!;
+				clearTimeout(req.timer);
+				let isHandled = false;
+
+				if (resp.type === "ERROR") {
+					req.reject(new Error(resp.error));
+					this.pendingRequests.delete(msgId);
+					return;
 				}
-				return;
-			}
-			if (resp.type === "ERROR" && this.pendingExports.has(resp.id)) {
-				const pending = this.pendingExports.get(resp.id);
-				if (pending) {
-					pending.reject(new Error(resp.error));
-					this.pendingExports.delete(resp.id);
+
+				if (resp.type === "ACK") {
+					req.resolve();
+					isHandled = true;
+				} else if (resp.type === "SEEK_DONE") {
+					req.resolve();
+					isHandled = true;
+				} else if (resp.type === "EXPORT_WAV_DONE") {
+					req.resolve(resp.blob);
+					isHandled = true;
 				}
-				return;
+
+				if (isHandled) {
+					this.pendingRequests.delete(msgId);
+					if (resp.type === "ACK" || resp.type === "EXPORT_WAV_DONE") {
+						return;
+					}
+				}
 			}
 
 			if (resp.type === "SEEK_NET") {
@@ -412,8 +450,6 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 				}
 				return;
 			}
-
-			if (resp.id !== this.currentMessageId) return;
 
 			switch (resp.type) {
 				case "ERROR":
@@ -451,10 +487,9 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 							const bufferedDuration =
 								this.nextStartTime - this.audioCtx.currentTime;
 							if (bufferedDuration > HIGH_WATER_MARK && !this.isWorkerPaused) {
-								this.postToWorker({
+								this.requestWorker({
 									type: "PAUSE",
-									id: this.currentMessageId,
-								});
+								}).catch(() => {});
 								this.isWorkerPaused = true;
 							}
 						}
@@ -485,13 +520,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 							}
 						}
 					}
-
 					this.dispatch("seeked");
-
-					if (this.pendingSeekResolve) {
-						this.pendingSeekResolve();
-						this.pendingSeekResolve = null;
-					}
 					break;
 			}
 		};
@@ -502,10 +531,6 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 			Atomics.add(this.sabHeader, IDX_SEEK_GEN, 1);
 			Atomics.notify(this.sabHeader, IDX_SEEK_GEN, 1);
 		}
-	}
-
-	private postToWorker(msg: WorkerRequest) {
-		this.worker?.postMessage(msg);
 	}
 
 	private scheduleChunk(
@@ -552,7 +577,7 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 			if (this.audioCtx && !this.isDecodingFinished) {
 				const bufferedDuration = this.nextStartTime - this.audioCtx.currentTime;
 				if (bufferedDuration < LOW_WATER_MARK && this.isWorkerPaused) {
-					this.postToWorker({ type: "RESUME", id: this.currentMessageId });
+					this.requestWorker({ type: "RESUME" }).catch(() => {});
 					this.isWorkerPaused = false;
 				}
 			}
@@ -659,6 +684,12 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		this.audioCtx?.suspend();
 		this.stopActiveSources();
 		this.activeSources = [];
+
+		for (const [_id, req] of this.pendingRequests) {
+			clearTimeout(req.timer);
+			req.reject(new Error("Player reset"));
+		}
+		this.pendingRequests.clear();
 
 		this.metadata = null;
 		this.isWorkerPaused = false;
