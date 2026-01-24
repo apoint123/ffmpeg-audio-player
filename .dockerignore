@@ -1,8 +1,8 @@
 .git
 node_modules
 dist
-src/assets/decode-audio.js
-src/assets/decode-audio.wasm
+src/assets/ffmpeg.js
+src/assets/ffmpeg.wasm
 cpp/deps
 *.log
 .DS_Store

@@ -7,7 +7,7 @@ import type {
 } from "@/types";
 import { toError } from "@/utils/errorUtils.js";
 import { SharedRingBuffer } from "@/utils/SharedRingBuffer.js";
-import createAudioDecoderCore from "../assets/decode-audio.js";
+import createAudioDecoderCore from "../assets/ffmpeg.js";
 
 const IDX_SEEK_GEN = 4; // Header(16 bytes) + 4 bytes offset
 
@@ -17,7 +17,7 @@ function getModule(): Promise<AudioDecoderModule> {
 	if (!ffmpegModulePromise) {
 		ffmpegModulePromise = createAudioDecoderCore({
 			locateFile: (path: string) =>
-				path.endsWith(".wasm") ? "/decode-audio.wasm" : path,
+				path.endsWith(".wasm") ? "/ffmpeg.wasm" : path,
 			print: (text: string) => console.log("[WASM]", text),
 			printErr: (text: string) => console.error("[WASM Error]", text),
 		}) as Promise<AudioDecoderModule>;

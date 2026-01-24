@@ -26,14 +26,14 @@ try {
 	process.exit(1);
 }
 
-const wasmSource = join(JS_OUTPUT_DIR, "decode-audio.wasm");
-const wasmDest = join(WASM_OUTPUT_DIR, "decode-audio.wasm");
+const wasmSource = join(JS_OUTPUT_DIR, "ffmpeg.wasm");
+const wasmDest = join(WASM_OUTPUT_DIR, "ffmpeg.wasm");
 
 if (existsSync(wasmSource)) {
 	console.log(`📂 正在移动 WASM 文件到 ${WASM_OUTPUT_DIR} ...`);
 	renameSync(wasmSource, wasmDest);
 } else {
-	console.error("❌ 错误：构建产物中未找到 decode-audio.wasm");
+	console.error("❌ 错误：构建产物中未找到 ffmpeg.wasm");
 	process.exit(1);
 }
 

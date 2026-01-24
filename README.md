@@ -24,7 +24,7 @@ We use TypeScript scripts running on Bun to handle the Docker build process. Thi
 
 1. Build the Docker image with Emscripten and FFmpeg.
 2. Compile the C++ code to WASM.
-3. Place the artifacts (`decode-audio.js` and `decode-audio.wasm`) into the correct directories.
+3. Place the artifacts (`ffmpeg.js` and `ffmpeg.wasm`) into the correct directories.
 
 ```bash
 # Cross-platform build command (Windows/Linux/macOS)

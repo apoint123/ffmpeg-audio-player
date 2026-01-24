@@ -6,8 +6,8 @@ out
 dist
 cpp/deps_headers
 *.tgz
-src/assets/decode-audio.js
-public/decode-audio.wasm
+src/assets/ffmpeg.js
+public/ffmpeg.wasm
 
 # code coverage
 coverage

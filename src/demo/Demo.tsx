@@ -7,7 +7,7 @@ import type React from "react";
 import { type ChangeEvent, useEffect, useRef, useState } from "react";
 import { FFmpegAudioPlayer } from "@/FFmpegAudioPlayer";
 import type { PlayerState } from "@/types";
-import AudioWorker from "@/workers/audio.worker?worker";
+import AudioWorker from "@/workers/ffmpeg.worker?worker";
 
 const formatTime = (seconds: number) => {
 	if (!Number.isFinite(seconds)) return "00:00";

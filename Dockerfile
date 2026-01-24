@@ -65,8 +65,8 @@ ENV LIBS="-L/opt/lib -lavformat -lavcodec -lavutil -lswresample -lSoundTouch"
 RUN emcc /app/audio-decode.cpp \
     $INCLUDES $LIBS \
     $EMCC_FLAGS $EMCC_OPTS --bind \
-    -o /app/decode-audio.js
+    -o /app/ffmpeg.js
 
 FROM scratch AS exportor
-COPY --from=wasm-builder /app/decode-audio.js /
-COPY --from=wasm-builder /app/decode-audio.wasm /
+COPY --from=wasm-builder /app/ffmpeg.js /
+COPY --from=wasm-builder /app/ffmpeg.wasm /
