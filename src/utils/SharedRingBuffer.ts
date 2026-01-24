@@ -10,7 +10,7 @@ export class SharedRingBuffer {
 	private buffer: Uint8Array;
 	private capacity: number;
 	private sab: SharedArrayBuffer;
-	private _writeGen = 0;
+	private writeGen = 0;
 
 	constructor(sab: SharedArrayBuffer) {
 		this.sab = sab;
@@ -36,12 +36,12 @@ export class SharedRingBuffer {
 	 * 写入数据 chunks
 	 */
 	async write(chunk: Uint8Array) {
-		const myGen = this._writeGen;
+		const myGen = this.writeGen;
 		let offset = 0;
 		let left = chunk.length;
 
 		while (left > 0) {
-			if (this._writeGen !== myGen) {
+			if (this.writeGen !== myGen) {
 				// console.warn("Zombie write detected and dropped.");
 				return;
 			}
@@ -95,7 +95,7 @@ export class SharedRingBuffer {
 	}
 
 	reset() {
-		this._writeGen++;
+		this.writeGen++;
 		Atomics.store(this.header, IDX_WRITE, 0);
 		Atomics.store(this.header, IDX_READ, 0);
 		Atomics.store(this.header, IDX_EOF, 0);
