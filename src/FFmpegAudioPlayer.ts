@@ -487,10 +487,16 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 							const bufferedDuration =
 								this.nextStartTime - this.audioCtx.currentTime;
 							if (bufferedDuration > HIGH_WATER_MARK && !this.isWorkerPaused) {
+								this.isWorkerPaused = true;
 								this.requestWorker({
 									type: "PAUSE",
-								}).catch(() => {});
-								this.isWorkerPaused = true;
+								}).catch((e) => {
+									console.error(
+										"[Player] Failed to pause worker for high water mark:",
+										e,
+									);
+									this.isWorkerPaused = false;
+								});
 							}
 						}
 					}
@@ -572,13 +578,22 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 		this.activeSources.push(source);
 
 		source.onended = () => {
-			this.activeSources = this.activeSources.filter((s) => s !== source);
+			const index = this.activeSources.indexOf(source);
+			if (index !== -1) {
+				this.activeSources.splice(index, 1);
+			}
 
 			if (this.audioCtx && !this.isDecodingFinished) {
 				const bufferedDuration = this.nextStartTime - this.audioCtx.currentTime;
 				if (bufferedDuration < LOW_WATER_MARK && this.isWorkerPaused) {
-					this.requestWorker({ type: "RESUME" }).catch(() => {});
 					this.isWorkerPaused = false;
+					this.requestWorker({ type: "RESUME" }).catch((err) => {
+						console.error(
+							"[Player] Failed to resume worker for low water mark:",
+							err,
+						);
+						this.isWorkerPaused = true;
+					});
 				}
 			}
 
