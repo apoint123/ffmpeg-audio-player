@@ -360,6 +360,7 @@ class AudioStreamDecoder {
         result.status.status = 0;
         result.isEOF = false;
         result.startTime = -1.0;
+        int consecutive_errors = 0;
 
         int output_channels = codec_ctx->ch_layout.nb_channels;
 
@@ -408,6 +409,8 @@ class AudioStreamDecoder {
             int receive_ret = avcodec_receive_frame(codec_ctx.get(), frame.get());
 
             if (receive_ret == 0) {
+                consecutive_errors = 0;
+
                 // 获取当前帧的 PTS
                 int64_t current_pts = frame->pts;
                 if (current_pts == AV_NOPTS_VALUE) {
@@ -477,10 +480,30 @@ class AudioStreamDecoder {
 
                 m_soundTouch.flush();
                 decode_done = true;
-            } else if (receive_ret != AVERROR(EAGAIN)) {
-                result.status = {receive_ret, "Receive frame error: " + get_error_str(receive_ret)};
-                break;
             } else {
+                if (receive_ret != AVERROR(EAGAIN)) {
+                    consecutive_errors++;
+
+                    double current_time =
+                        (m_next_pts != AV_NOPTS_VALUE) ? m_next_pts * av_q2d(m_time_base) : -1.0;
+                    double total_duration = (format_ctx->duration != AV_NOPTS_VALUE)
+                                                ? (double)format_ctx->duration / AV_TIME_BASE
+                                                : -1.0;
+
+                    fprintf(
+                        stderr,
+                        "[Decoder] Ignored decode error: %d (%s). Time: %.3f / %.3f. Count: %d\n",
+                        receive_ret, get_error_str(receive_ret).c_str(), current_time,
+                        total_duration, consecutive_errors);
+
+                    if (consecutive_errors > 50 || receive_ret == AVERROR(ENOMEM) ||
+                        receive_ret == AVERROR(EINVAL)) {
+                        result.status = {receive_ret,
+                                         "Fatal decode error: " + get_error_str(receive_ret)};
+                        break;
+                    }
+                }
+
                 int read_ret = av_read_frame(format_ctx.get(), packet.get());
                 if (read_ret < 0) {
                     if (read_ret == AVERROR_EOF) {
@@ -491,7 +514,19 @@ class AudioStreamDecoder {
                     }
                 } else {
                     if (packet->stream_index == audio_stream_index) {
-                        avcodec_send_packet(codec_ctx.get(), packet.get());
+                        int send_ret = avcodec_send_packet(codec_ctx.get(), packet.get());
+
+                        if (send_ret < 0 && send_ret != AVERROR(EAGAIN) &&
+                            send_ret != AVERROR_EOF) {
+                            double pkt_time = (packet->pts != AV_NOPTS_VALUE)
+                                                  ? packet->pts * av_q2d(m_time_base)
+                                                  : -1.0;
+
+                            fprintf(stderr,
+                                    "[Decoder] Packet send failed: %d (%s). Packet Time: "
+                                    "%.3f\n",
+                                    send_ret, get_error_str(send_ret).c_str(), pkt_time);
+                        }
                     }
                     av_packet_unref(packet.get());
                 }
