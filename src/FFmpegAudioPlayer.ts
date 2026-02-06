@@ -565,7 +565,9 @@ export class FFmpegAudioPlayer extends TypedEventTarget<FFmpegPlayerEventMap> {
 			this.nextStartTime = now;
 		}
 
-		this.syncTimeAnchor(this.nextStartTime, chunkStartTime);
+		if (chunkStartTime >= 0) {
+			this.syncTimeAnchor(this.nextStartTime, chunkStartTime);
+		}
 
 		const source = ctx.createBufferSource();
 		source.buffer = audioBuffer;

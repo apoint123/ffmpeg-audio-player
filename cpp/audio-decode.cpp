@@ -1,9 +1,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -183,6 +181,7 @@ class AudioStreamDecoder {
     int64_t m_next_pts = AV_NOPTS_VALUE;
     // 当前流的时间基
     AVRational m_time_base = {1, 1};
+    double m_current_output_time = 0.0;
 
     AudioProperties setupDecoder() {
         Status status = {0, ""};
@@ -359,7 +358,7 @@ class AudioStreamDecoder {
         ChunkResult result;
         result.status.status = 0;
         result.isEOF = false;
-        result.startTime = -1.0;
+        result.startTime = m_current_output_time;
         int consecutive_errors = 0;
 
         int output_channels = codec_ctx->ch_layout.nb_channels;
@@ -533,6 +532,11 @@ class AudioStreamDecoder {
             }
         }
 
+        if (current_output_samples > 0 && codec_ctx->sample_rate > 0) {
+            double duration = (double)current_output_samples / codec_ctx->sample_rate;
+            m_current_output_time += duration;
+        }
+
         // Interleaved Int16 格式
         if (format == SampleFormat::InterleavedS16) {
             int total_samples = current_output_samples * output_channels;
@@ -605,6 +609,8 @@ class AudioStreamDecoder {
         // Seek 后重置预测时钟为 NOPTS，强制让下一帧的真实 PTS 来校准
         m_next_pts = AV_NOPTS_VALUE;
 
+        m_current_output_time = timestamp;
+
         return status;
     }
 
@@ -626,6 +632,7 @@ class AudioStreamDecoder {
 
         initialized = false;
         m_next_pts = AV_NOPTS_VALUE;
+        m_current_output_time = 0.0;
 
         for (auto& buf : m_staging_buffers) {
             std::vector<float>().swap(buf);
