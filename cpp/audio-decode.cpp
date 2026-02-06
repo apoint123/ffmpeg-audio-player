@@ -181,6 +181,8 @@ class AudioStreamDecoder {
     int64_t m_next_pts = AV_NOPTS_VALUE;
     // 当前流的时间基
     AVRational m_time_base = {1, 1};
+
+    double m_current_tempo = 1.0;
     double m_current_output_time = 0.0;
 
     AudioProperties setupDecoder() {
@@ -293,7 +295,10 @@ class AudioStreamDecoder {
     AudioStreamDecoder() {}
     ~AudioStreamDecoder() { close(); }
 
-    void setTempo(double tempo) { m_soundTouch.setTempo(tempo); }
+    void setTempo(double tempo) {
+        m_soundTouch.setTempo(tempo);
+        m_current_tempo = tempo;
+    }
 
     void setPitch(double pitch) { m_soundTouch.setPitch(pitch); }
 
@@ -533,8 +538,9 @@ class AudioStreamDecoder {
         }
 
         if (current_output_samples > 0 && codec_ctx->sample_rate > 0) {
-            double duration = (double)current_output_samples / codec_ctx->sample_rate;
-            m_current_output_time += duration;
+            double wall_duration = (double)current_output_samples / codec_ctx->sample_rate;
+            double source_duration = wall_duration * m_current_tempo;
+            m_current_output_time += source_duration;
         }
 
         // Interleaved Int16 格式
